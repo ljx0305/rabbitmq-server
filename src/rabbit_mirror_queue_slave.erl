@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2010-2015 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2010-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_mirror_queue_slave).
@@ -35,8 +35,9 @@
 -behaviour(gen_server2).
 -behaviour(gm).
 
--include("rabbit.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
 
+-include("amqqueue.hrl").
 -include("gm_specs.hrl").
 
 %%----------------------------------------------------------------------------
@@ -76,8 +77,9 @@ set_maximum_since_use(QPid, Age) ->
 
 info(QPid) -> gen_server2:call(QPid, info, infinity).
 
-init(Q) ->
-    ?store_proc_name(Q#amqqueue.name),
+init(Q) when ?is_amqqueue(Q) ->
+    QName = amqqueue:get_name(Q),
+    ?store_proc_name(QName),
     {ok, {not_started, Q}, hibernate,
      {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN,
       ?DESIRED_HIBERNATE}, ?MODULE}.
@@ -85,7 +87,8 @@ init(Q) ->
 go(SPid, sync)  -> gen_server2:call(SPid, go, infinity);
 go(SPid, async) -> gen_server2:cast(SPid, go).
 
-handle_go(Q = #amqqueue{name = QName}) ->
+handle_go(Q) when ?is_amqqueue(Q) ->
+    QName = amqqueue:get_name(Q),
     %% We join the GM group before we add ourselves to the amqqueue
     %% record. As a result:
     %% 1. We can receive msgs from GM that correspond to messages we will
@@ -119,27 +122,27 @@ handle_go(Q = #amqqueue{name = QName}) ->
             ok = rabbit_memory_monitor:register(
                    Self, {rabbit_amqqueue, set_ram_duration_target, [Self]}),
             {ok, BQ} = application:get_env(backing_queue_module),
-            Q1 = Q #amqqueue { pid = QPid },
+            QPid = amqqueue:get_pid(Q),
             _ = BQ:delete_crashed(Q), %% For crash recovery
-            BQS = bq_init(BQ, Q1, new),
-            State = #state { q                   = Q1,
+            BQS = bq_init(BQ, Q, new),
+            State = #state { q                   = Q,
                              gm                  = GM,
                              backing_queue       = BQ,
                              backing_queue_state = BQS,
                              rate_timer_ref      = undefined,
                              sync_timer_ref      = undefined,
 
-                             sender_queues       = dict:new(),
-                             msg_id_ack          = dict:new(),
+                             sender_queues       = #{},
+                             msg_id_ack          = #{},
 
-                             msg_id_status       = dict:new(),
+                             msg_id_status       = #{},
                              known_senders       = pmon:new(delegate),
 
                              depth_delta         = undefined
                    },
             ok = gm:broadcast(GM, request_depth),
             ok = gm:validate_members(GM, [GM | [G || {G, _} <- GMPids]]),
-            rabbit_mirror_queue_misc:maybe_auto_sync(Q1),
+            rabbit_mirror_queue_misc:maybe_auto_sync(Q),
             {ok, State};
         {stale, StalePid} ->
             rabbit_mirror_queue_misc:log_warning(
@@ -163,8 +166,11 @@ handle_go(Q = #amqqueue{name = QName}) ->
 
 init_it(Self, GM, Node, QName) ->
     case mnesia:read({rabbit_queue, QName}) of
-        [Q = #amqqueue { pid = QPid, slave_pids = SPids, gm_pids = GMPids,
-                         slave_pids_pending_shutdown = PSPids}] ->
+        [Q] when ?is_amqqueue(Q) ->
+            QPid = amqqueue:get_pid(Q),
+            SPids = amqqueue:get_slave_pids(Q),
+            GMPids = amqqueue:get_gm_pids(Q),
+            PSPids = amqqueue:get_slave_pids_pending_shutdown(Q),
             case [Pid || Pid <- [QPid | SPids], node(Pid) =:= Node] of
                 []     -> stop_pending_slaves(QName, PSPids),
                           add_slave(Q, Self, GM),
@@ -175,12 +181,11 @@ init_it(Self, GM, Node, QName) ->
                           end;
                 [SPid] -> case rabbit_mnesia:is_process_alive(SPid) of
                               true  -> existing;
-                              false -> GMPids1 = [T || T = {_, S} <- GMPids,
-                                                       S =/= SPid],
-                                       Q1 = Q#amqqueue{
-                                              slave_pids = SPids -- [SPid],
-                                              gm_pids    = GMPids1},
-                                       add_slave(Q1, Self, GM),
+                              false -> GMPids1 = [T || T = {_, S} <- GMPids, S =/= SPid],
+                                       SPids1 = SPids -- [SPid],
+                                       Q1 = amqqueue:set_slave_pids(Q, SPids1),
+                                       Q2 = amqqueue:set_gm_pids(Q1, GMPids1),
+                                       add_slave(Q2, Self, GM),
                                        {new, QPid, GMPids1}
                           end
             end;
@@ -197,8 +202,10 @@ stop_pending_slaves(QName, Pids) ->
          case erlang:process_info(Pid, dictionary) of
              undefined -> ok;
              {dictionary, Dict} ->
+                 Vhost = QName#resource.virtual_host,
+                 {ok, AmqQSup} = rabbit_amqqueue_sup_sup:find_for_vhost(Vhost),
                  case proplists:get_value('$ancestors', Dict) of
-                     [Sup, rabbit_amqqueue_sup_sup | _] ->
+                     [Sup, AmqQSup | _] ->
                          exit(Sup, kill),
                          exit(Pid, kill);
                      _ ->
@@ -210,9 +217,14 @@ stop_pending_slaves(QName, Pids) ->
 
 %% Add to the end, so they are in descending order of age, see
 %% rabbit_mirror_queue_misc:promote_slave/1
-add_slave(Q = #amqqueue { slave_pids = SPids, gm_pids = GMPids }, New, GM) ->
-    rabbit_mirror_queue_misc:store_updated_slaves(
-      Q#amqqueue{slave_pids = SPids ++ [New], gm_pids = [{GM, New} | GMPids]}).
+add_slave(Q0, New, GM) when ?is_amqqueue(Q0) ->
+    SPids = amqqueue:get_slave_pids(Q0),
+    GMPids = amqqueue:get_gm_pids(Q0),
+    SPids1 = SPids ++ [New],
+    GMPids1 = [{GM, New} | GMPids],
+    Q1 = amqqueue:set_slave_pids(Q0, SPids1),
+    Q2 = amqqueue:set_gm_pids(Q1, GMPids1),
+    rabbit_mirror_queue_misc:store_updated_slaves(Q2).
 
 handle_call(go, _From, {not_started, Q} = NotStarted) ->
     case handle_go(Q) of
@@ -221,13 +233,19 @@ handle_call(go, _From, {not_started, Q} = NotStarted) ->
     end;
 
 handle_call({gm_deaths, DeadGMPids}, From,
-            State = #state { gm = GM, q = Q = #amqqueue {
-                                                 name = QName, pid = MPid }}) ->
+            State = #state{ gm = GM, q = Q,
+                            backing_queue = BQ,
+                            backing_queue_state = BQS}) when ?is_amqqueue(Q) ->
+    QName = amqqueue:get_name(Q),
+    MPid = amqqueue:get_pid(Q),
     Self = self(),
     case rabbit_mirror_queue_misc:remove_from_queue(QName, Self, DeadGMPids) of
         {error, not_found} ->
             gen_server2:reply(From, ok),
             {stop, normal, State};
+        {error, {not_synced, _SPids}} ->
+            BQ:delete_and_terminate({error, not_synced}, BQS),
+            {stop, normal, State#state{backing_queue_state = undefined}};
         {ok, Pid, DeadPids, ExtraNodes} ->
             rabbit_mirror_queue_misc:report_deaths(Self, false, QName,
                                                    DeadPids),
@@ -262,7 +280,9 @@ handle_call({gm_deaths, DeadGMPids}, From,
                     %% death. That is all process_death does, create
                     %% some traffic.
                     ok = gm:broadcast(GM, process_death),
-                    noreply(State #state { q = Q #amqqueue { pid = Pid } })
+                    Q1 = amqqueue:set_pid(Q, Pid),
+                    State1 = State#state{q = Q1},
+                    noreply(State1)
             end
     end;
 
@@ -278,20 +298,22 @@ handle_cast(go, {not_started, Q} = NotStarted) ->
 handle_cast({run_backing_queue, Mod, Fun}, State) ->
     noreply(run_backing_queue(Mod, Fun, State));
 
-handle_cast({gm, Instruction}, State = #state{q = #amqqueue { name = QName }}) ->
+handle_cast({gm, Instruction}, State = #state{q = Q0}) when ?is_amqqueue(Q0) ->
+    QName = amqqueue:get_name(Q0),
     case rabbit_amqqueue:lookup(QName) of
-	{ok, #amqqueue{slave_pids = SPids}} ->
-	    case lists:member(self(), SPids) of
-		true ->
-		    handle_process_result(process_instruction(Instruction, State));
-		false ->
-		    %% Potentially a duplicated slave caused by a partial partition,
-		    %% will stop as a new slave could start unaware of our presence
-		    {stop, shutdown, State}
-	    end;
-	{error, not_found} ->
-	    %% Would not expect this to happen after fixing #953
-	    {stop, shutdown, State}
+       {ok, Q1} when ?is_amqqueue(Q1) ->
+           SPids = amqqueue:get_slave_pids(Q1),
+           case lists:member(self(), SPids) of
+               true ->
+                   handle_process_result(process_instruction(Instruction, State));
+               false ->
+                   %% Potentially a duplicated slave caused by a partial partition,
+                   %% will stop as a new slave could start unaware of our presence
+                   {stop, shutdown, State}
+           end;
+       {error, not_found} ->
+           %% Would not expect this to happen after fixing #953
+           {stop, shutdown, State}
     end;
 
 handle_cast({deliver, Delivery = #delivery{sender = Sender, flow = Flow}, true},
@@ -300,6 +322,8 @@ handle_cast({deliver, Delivery = #delivery{sender = Sender, flow = Flow}, true},
     %% We are acking messages to the channel process that sent us
     %% the message delivery. See
     %% rabbit_amqqueue_process:handle_ch_down for more info.
+    %% If message is rejected by the master, the publish will be nacked
+    %% even if slaves confirm it. No need to check for length here.
     maybe_flow_ack(Sender, Flow),
     noreply(maybe_enqueue_message(Delivery, State));
 
@@ -310,7 +334,7 @@ handle_cast({sync_start, Ref, Syncer},
     State1 = #state{rate_timer_ref = TRef} = ensure_rate_timer(State),
     S = fun({MA, TRefN, BQSN}) ->
                 State1#state{depth_delta         = undefined,
-                             msg_id_ack          = dict:from_list(MA),
+                             msg_id_ack          = maps:from_list(MA),
                              rate_timer_ref      = TRefN,
                              backing_queue_state = BQSN}
         end,
@@ -368,6 +392,9 @@ handle_info({'EXIT', _Pid, Reason}, State) ->
 
 handle_info({bump_credit, Msg}, State) ->
     credit_flow:handle_bump_msg(Msg),
+    noreply(State);
+
+handle_info(bump_reduce_memory_use, State) ->
     noreply(State);
 
 %% In the event of a short partition during sync we can detect the
@@ -509,11 +536,16 @@ handle_terminate([_SPid], _Reason) ->
 
 infos(Items, State) -> [{Item, i(Item, State)} || Item <- Items].
 
-i(pid,             _State)                                   -> self();
-i(name,            #state { q = #amqqueue { name = Name } }) -> Name;
-i(master_pid,      #state { q = #amqqueue { pid  = MPid } }) -> MPid;
-i(is_synchronised, #state { depth_delta = DD })              -> DD =:= 0;
-i(Item,            _State) -> throw({bad_argument, Item}).
+i(pid, _State) ->
+    self();
+i(name, #state{q = Q}) when ?is_amqqueue(Q) ->
+    amqqueue:get_name(Q);
+i(master_pid, #state{q = Q}) when ?is_amqqueue(Q) ->
+    amqqueue:get_pid(Q);
+i(is_synchronised, #state{depth_delta = DD}) ->
+    DD =:= 0;
+i(Item, _State) ->
+    throw({bad_argument, Item}).
 
 bq_init(BQ, Q, Recover) ->
     Self = self(),
@@ -530,6 +562,11 @@ run_backing_queue(Mod, Fun, State = #state { backing_queue       = BQ,
                                              backing_queue_state = BQS }) ->
     State #state { backing_queue_state = BQ:invoke(Mod, Fun, BQS) }.
 
+%% This feature was used by `rabbit_amqqueue_process` and
+%% `rabbit_mirror_queue_slave` up-to and including RabbitMQ 3.7.x. It is
+%% unused in 3.8.x and thus deprecated. We keep it to support in-place
+%% upgrades to 3.8.x (i.e. mixed-version clusters), but it is a no-op
+%% starting with that version.
 send_mandatory(#delivery{mandatory  = false}) ->
     ok;
 send_mandatory(#delivery{mandatory  = true,
@@ -545,8 +582,8 @@ send_or_record_confirm(published, #delivery { sender     = ChPid,
                                               message    = #basic_message {
                                                 id            = MsgId,
                                                 is_persistent = true } },
-                       MS, #state { q = #amqqueue { durable = true } }) ->
-    dict:store(MsgId, {published, ChPid, MsgSeqNo} , MS);
+                       MS, #state{q = Q}) when ?amqqueue_is_durable(Q) ->
+    maps:put(MsgId, {published, ChPid, MsgSeqNo} , MS);
 send_or_record_confirm(_Status, #delivery { sender     = ChPid,
                                             confirm    = true,
                                             msg_seq_no = MsgSeqNo },
@@ -559,7 +596,7 @@ confirm_messages(MsgIds, State = #state { msg_id_status = MS }) ->
         lists:foldl(
           fun (MsgId, {CMsN, MSN} = Acc) ->
                   %% We will never see 'discarded' here
-                  case dict:find(MsgId, MSN) of
+                  case maps:find(MsgId, MSN) of
                       error ->
                           %% If it needed confirming, it'll have
                           %% already been done.
@@ -567,12 +604,12 @@ confirm_messages(MsgIds, State = #state { msg_id_status = MS }) ->
                       {ok, published} ->
                           %% Still not seen it from the channel, just
                           %% record that it's been confirmed.
-                          {CMsN, dict:store(MsgId, confirmed, MSN)};
+                          {CMsN, maps:put(MsgId, confirmed, MSN)};
                       {ok, {published, ChPid, MsgSeqNo}} ->
                           %% Seen from both GM and Channel. Can now
                           %% confirm.
                           {rabbit_misc:gb_trees_cons(ChPid, MsgSeqNo, CMsN),
-                           dict:erase(MsgId, MSN)};
+                           maps:remove(MsgId, MSN)};
                       {ok, confirmed} ->
                           %% It's already been confirmed. This is
                           %% probably it's been both sync'd to disk
@@ -590,7 +627,7 @@ handle_process_result({stop, State}) -> {stop, normal, State}.
 
 -spec promote_me({pid(), term()}, #state{}) -> no_return().
 
-promote_me(From, #state { q                   = Q = #amqqueue { name = QName },
+promote_me(From, #state { q                   = Q0,
                           gm                  = GM,
                           backing_queue       = BQ,
                           backing_queue_state = BQS,
@@ -598,13 +635,14 @@ promote_me(From, #state { q                   = Q = #amqqueue { name = QName },
                           sender_queues       = SQ,
                           msg_id_ack          = MA,
                           msg_id_status       = MS,
-                          known_senders       = KS }) ->
+                          known_senders       = KS}) when ?is_amqqueue(Q0) ->
+    QName = amqqueue:get_name(Q0),
     rabbit_mirror_queue_misc:log_info(QName, "Promoting slave ~s to master~n",
                                       [rabbit_misc:pid_to_string(self())]),
-    Q1 = Q #amqqueue { pid = self() },
-    {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(
-                   Q1, GM, rabbit_mirror_queue_master:sender_death_fun(),
-                   rabbit_mirror_queue_master:depth_fun()),
+    Q1 = amqqueue:set_pid(Q0, self()),
+    DeathFun = rabbit_mirror_queue_master:sender_death_fun(),
+    DepthFun = rabbit_mirror_queue_master:depth_fun(),
+    {ok, CPid} = rabbit_mirror_queue_coordinator:start_link(Q1, GM, DeathFun, DepthFun),
     true = unlink(GM),
     gen_server2:reply(From, {promote, CPid}),
 
@@ -672,21 +710,21 @@ promote_me(From, #state { q                   = Q = #amqqueue { name = QName },
     %% Master, or MTC in queue_process.
 
     St = [published, confirmed, discarded],
-    SS = dict:filter(fun (_MsgId, Status) -> lists:member(Status, St) end, MS),
-    AckTags = [AckTag || {_MsgId, AckTag} <- dict:to_list(MA)],
+    SS = maps:filter(fun (_MsgId, Status) -> lists:member(Status, St) end, MS),
+    AckTags = [AckTag || {_MsgId, AckTag} <- maps:to_list(MA)],
 
     MasterState = rabbit_mirror_queue_master:promote_backing_queue_state(
                     QName, CPid, BQ, BQS, GM, AckTags, SS, MPids),
 
-    MTC = dict:fold(fun (MsgId, {published, ChPid, MsgSeqNo}, MTC0) ->
+    MTC = maps:fold(fun (MsgId, {published, ChPid, MsgSeqNo}, MTC0) ->
                             gb_trees:insert(MsgId, {ChPid, MsgSeqNo}, MTC0);
                         (_Msgid, _Status, MTC0) ->
                             MTC0
                     end, gb_trees:empty(), MS),
     Deliveries = [promote_delivery(Delivery) ||
-                   {_ChPid, {PubQ, _PendCh, _ChState}} <- dict:to_list(SQ),
+                   {_ChPid, {PubQ, _PendCh, _ChState}} <- maps:to_list(SQ),
                    Delivery <- queue:to_list(PubQ)],
-    AwaitGmDown = [ChPid || {ChPid, {_, _, down_from_ch}} <- dict:to_list(SQ)],
+    AwaitGmDown = [ChPid || {ChPid, {_, _, down_from_ch}} <- maps:to_list(SQ)],
     KS1 = lists:foldl(fun (ChPid0, KS0) ->
                               pmon:demonitor(ChPid0, KS0)
                       end, KS, AwaitGmDown),
@@ -798,20 +836,20 @@ forget_sender(Down1, Down2) when Down1 =/= Down2 -> true.
 maybe_forget_sender(ChPid, ChState, State = #state { sender_queues = SQ,
                                                      msg_id_status = MS,
                                                      known_senders = KS }) ->
-    case dict:find(ChPid, SQ) of
+    case maps:find(ChPid, SQ) of
         error ->
             State;
         {ok, {MQ, PendCh, ChStateRecord}} ->
             case forget_sender(ChState, ChStateRecord) of
                 true ->
                     credit_flow:peer_down(ChPid),
-                    State #state { sender_queues = dict:erase(ChPid, SQ),
+                    State #state { sender_queues = maps:remove(ChPid, SQ),
                                    msg_id_status = lists:foldl(
-                                                     fun dict:erase/2,
+                                                     fun maps:remove/2,
                                                      MS, sets:to_list(PendCh)),
                                    known_senders = pmon:demonitor(ChPid, KS) };
                 false ->
-                    SQ1 = dict:store(ChPid, {MQ, PendCh, ChState}, SQ),
+                    SQ1 = maps:put(ChPid, {MQ, PendCh, ChState}, SQ),
                     State #state { sender_queues = SQ1 }
             end
     end.
@@ -823,32 +861,32 @@ maybe_enqueue_message(
     send_mandatory(Delivery), %% must do this before confirms
     State1 = ensure_monitoring(ChPid, State),
     %% We will never see {published, ChPid, MsgSeqNo} here.
-    case dict:find(MsgId, MS) of
+    case maps:find(MsgId, MS) of
         error ->
             {MQ, PendingCh, ChState} = get_sender_queue(ChPid, SQ),
             MQ1 = queue:in(Delivery, MQ),
-            SQ1 = dict:store(ChPid, {MQ1, PendingCh, ChState}, SQ),
+            SQ1 = maps:put(ChPid, {MQ1, PendingCh, ChState}, SQ),
             State1 #state { sender_queues = SQ1 };
         {ok, Status} ->
             MS1 = send_or_record_confirm(
-                    Status, Delivery, dict:erase(MsgId, MS), State1),
+                    Status, Delivery, maps:remove(MsgId, MS), State1),
             SQ1 = remove_from_pending_ch(MsgId, ChPid, SQ),
             State1 #state { msg_id_status = MS1,
                             sender_queues = SQ1 }
     end.
 
 get_sender_queue(ChPid, SQ) ->
-    case dict:find(ChPid, SQ) of
+    case maps:find(ChPid, SQ) of
         error     -> {queue:new(), sets:new(), running};
         {ok, Val} -> Val
     end.
 
 remove_from_pending_ch(MsgId, ChPid, SQ) ->
-    case dict:find(ChPid, SQ) of
+    case maps:find(ChPid, SQ) of
         error ->
             SQ;
         {ok, {MQ, PendingCh, ChState}} ->
-            dict:store(ChPid, {MQ, sets:del_element(MsgId, PendingCh), ChState},
+            maps:put(ChPid, {MQ, sets:del_element(MsgId, PendingCh), ChState},
                        SQ)
     end.
 
@@ -865,7 +903,7 @@ publish_or_discard(Status, ChPid, MsgId,
         case queue:out(MQ) of
             {empty, _MQ2} ->
                 {MQ, sets:add_element(MsgId, PendingCh),
-                 dict:store(MsgId, Status, MS)};
+                 maps:put(MsgId, Status, MS)};
             {{value, Delivery = #delivery {
                        message = #basic_message { id = MsgId } }}, MQ2} ->
                 {MQ2, PendingCh,
@@ -880,7 +918,7 @@ publish_or_discard(Status, ChPid, MsgId,
                 %% expecting any confirms from us.
                 {MQ, PendingCh, MS}
         end,
-    SQ1 = dict:store(ChPid, {MQ1, PendingCh1, ChState}, SQ),
+    SQ1 = maps:put(ChPid, {MQ1, PendingCh1, ChState}, SQ),
     State1 #state { sender_queues = SQ1, msg_id_status = MS1 }.
 
 
@@ -1002,9 +1040,9 @@ msg_ids_to_acktags(MsgIds, MA) ->
     {AckTags, MA1} =
         lists:foldl(
           fun (MsgId, {Acc, MAN}) ->
-                  case dict:find(MsgId, MA) of
+                  case maps:find(MsgId, MA) of
                       error        -> {Acc, MAN};
-                      {ok, AckTag} -> {[AckTag | Acc], dict:erase(MsgId, MAN)}
+                      {ok, AckTag} -> {[AckTag | Acc], maps:remove(MsgId, MAN)}
                   end
           end, {[], MA}, MsgIds),
     {lists:reverse(AckTags), MA1}.
@@ -1012,7 +1050,7 @@ msg_ids_to_acktags(MsgIds, MA) ->
 maybe_store_ack(false, _MsgId, _AckTag, State) ->
     State;
 maybe_store_ack(true, MsgId, AckTag, State = #state { msg_id_ack = MA }) ->
-    State #state { msg_id_ack = dict:store(MsgId, AckTag, MA) }.
+    State #state { msg_id_ack = maps:put(MsgId, AckTag, MA) }.
 
 set_delta(0,        State = #state { depth_delta = undefined }) ->
     ok = record_synchronised(State#state.q),
@@ -1038,19 +1076,22 @@ update_ram_duration(BQ, BQS) ->
         rabbit_memory_monitor:report_ram_duration(self(), RamDuration),
     BQ:set_ram_duration_target(DesiredDuration, BQS1).
 
-record_synchronised(#amqqueue { name = QName }) ->
+record_synchronised(Q0) when ?is_amqqueue(Q0) ->
+    QName = amqqueue:get_name(Q0),
     Self = self(),
-    case rabbit_misc:execute_mnesia_transaction(
-           fun () ->
-                   case mnesia:read({rabbit_queue, QName}) of
-                       [] ->
-                           ok;
-                       [Q1 = #amqqueue { sync_slave_pids = SSPids }] ->
-                           Q2 = Q1#amqqueue{sync_slave_pids = [Self | SSPids]},
-                           rabbit_mirror_queue_misc:store_updated_slaves(Q2),
-                           {ok, Q2}
-                   end
-           end) of
-        ok      -> ok;
-        {ok, Q} -> rabbit_mirror_queue_misc:maybe_drop_master_after_sync(Q)
+    F = fun () ->
+            case mnesia:read({rabbit_queue, QName}) of
+                [] ->
+                    ok;
+                [Q1] when ?is_amqqueue(Q1) ->
+                    SSPids = amqqueue:get_sync_slave_pids(Q1),
+                    SSPids1 = [Self | SSPids],
+                    Q2 = amqqueue:set_sync_slave_pids(Q1, SSPids1),
+                    rabbit_mirror_queue_misc:store_updated_slaves(Q2),
+                    {ok, Q2}
+            end
+        end,
+    case rabbit_misc:execute_mnesia_transaction(F) of
+        ok -> ok;
+        {ok, Q2} -> rabbit_mirror_queue_misc:maybe_drop_master_after_sync(Q2)
     end.

@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_msg_store).
@@ -155,7 +155,7 @@
 -type client_msstate() :: #client_msstate {
                       server             :: server(),
                       client_ref         :: client_ref(),
-                      file_handle_cache  :: dict:dict(),
+                      file_handle_cache  :: map(),
                       index_state        :: any(),
                       index_module       :: atom(),
                       dir                :: file:filename(),
@@ -172,33 +172,6 @@
         'undefined' | fun ((gb_sets:set(), 'written' | 'ignored') -> any()).
 -type maybe_close_fds_fun() :: 'undefined' | fun (() -> 'ok').
 -type deletion_thunk() :: fun (() -> boolean()).
-
--spec start_link
-        (atom(), file:filename(), [binary()] | 'undefined',
-         {msg_ref_delta_gen(A), A}) -> rabbit_types:ok_pid_or_error().
--spec successfully_recovered_state(server()) -> boolean().
--spec client_init(server(), client_ref(), maybe_msg_id_fun(),
-                        maybe_close_fds_fun()) -> client_msstate().
--spec client_terminate(client_msstate()) -> 'ok'.
--spec client_delete_and_terminate(client_msstate()) -> 'ok'.
--spec client_ref(client_msstate()) -> client_ref().
--spec close_all_indicated
-        (client_msstate()) -> rabbit_types:ok(client_msstate()).
--spec write(rabbit_types:msg_id(), msg(), client_msstate()) -> 'ok'.
--spec write_flow(rabbit_types:msg_id(), msg(), client_msstate()) -> 'ok'.
--spec read(rabbit_types:msg_id(), client_msstate()) ->
-                     {rabbit_types:ok(msg()) | 'not_found', client_msstate()}.
--spec contains(rabbit_types:msg_id(), client_msstate()) -> boolean().
--spec remove([rabbit_types:msg_id()], client_msstate()) -> 'ok'.
-
--spec set_maximum_since_use(server(), non_neg_integer()) -> 'ok'.
--spec has_readers(non_neg_integer(), gc_state()) -> boolean().
--spec combine_files(non_neg_integer(), non_neg_integer(), gc_state()) ->
-                              deletion_thunk().
--spec delete_file(non_neg_integer(), gc_state()) -> deletion_thunk().
--spec force_recovery(file:filename(), server()) -> 'ok'.
--spec transform_dir(file:filename(), server(),
-        fun ((any()) -> (rabbit_types:ok_or_error2(msg(), any())))) -> 'ok'.
 
 %%----------------------------------------------------------------------------
 
@@ -263,7 +236,7 @@
 %% updated.
 %%
 %% On non-clean startup, we scan the files we discover, dealing with
-%% the possibilites of a crash having occurred during a compaction
+%% the possibilities of a crash having occurred during a compaction
 %% (this consists of tidyup - the compaction is deliberately designed
 %% such that data is duplicated on disk rather than risking it being
 %% lost), and rebuild the file summary and index ETS table.
@@ -472,6 +445,10 @@
 %% public API
 %%----------------------------------------------------------------------------
 
+-spec start_link
+        (atom(), file:filename(), [binary()] | 'undefined',
+         {msg_ref_delta_gen(A), A}) -> rabbit_types:ok_pid_or_error().
+
 start_link(Type, Dir, ClientRefs, StartupFunState) when is_atom(Type) ->
     gen_server2:start_link(?MODULE,
                            [Type, Dir, ClientRefs, StartupFunState],
@@ -482,8 +459,13 @@ start_global_store_link(Type, Dir, ClientRefs, StartupFunState) when is_atom(Typ
                            [Type, Dir, ClientRefs, StartupFunState],
                            [{timeout, infinity}]).
 
+-spec successfully_recovered_state(server()) -> boolean().
+
 successfully_recovered_state(Server) ->
     gen_server2:call(Server, successfully_recovered_state, infinity).
+
+-spec client_init(server(), client_ref(), maybe_msg_id_fun(),
+                        maybe_close_fds_fun()) -> client_msstate().
 
 client_init(Server, Ref, MsgOnDiskFun, CloseFDsFun) when is_pid(Server); is_atom(Server) ->
     {IState, IModule, Dir, GCPid,
@@ -495,7 +477,7 @@ client_init(Server, Ref, MsgOnDiskFun, CloseFDsFun) when is_pid(Server); is_atom
                                           ?CREDIT_DISC_BOUND),
     #client_msstate { server             = Server,
                       client_ref         = Ref,
-                      file_handle_cache  = dict:new(),
+                      file_handle_cache  = #{},
                       index_state        = IState,
                       index_module       = IModule,
                       dir                = Dir,
@@ -506,16 +488,24 @@ client_init(Server, Ref, MsgOnDiskFun, CloseFDsFun) when is_pid(Server); is_atom
                       flying_ets         = FlyingEts,
                       credit_disc_bound  = CreditDiscBound }.
 
+-spec client_terminate(client_msstate()) -> 'ok'.
+
 client_terminate(CState = #client_msstate { client_ref = Ref }) ->
     close_all_handles(CState),
     ok = server_call(CState, {client_terminate, Ref}).
+
+-spec client_delete_and_terminate(client_msstate()) -> 'ok'.
 
 client_delete_and_terminate(CState = #client_msstate { client_ref = Ref }) ->
     close_all_handles(CState),
     ok = server_cast(CState, {client_dying, Ref}),
     ok = server_cast(CState, {client_delete, Ref}).
 
+-spec client_ref(client_msstate()) -> client_ref().
+
 client_ref(#client_msstate { client_ref = Ref }) -> Ref.
+
+-spec write_flow(rabbit_types:msg_id(), msg(), client_msstate()) -> 'ok'.
 
 write_flow(MsgId, Msg,
            CState = #client_msstate {
@@ -528,7 +518,12 @@ write_flow(MsgId, Msg,
     credit_flow:send(Server, CreditDiscBound),
     client_write(MsgId, Msg, flow, CState).
 
+-spec write(rabbit_types:msg_id(), msg(), client_msstate()) -> 'ok'.
+
 write(MsgId, Msg, CState) -> client_write(MsgId, Msg, noflow, CState).
+
+-spec read(rabbit_types:msg_id(), client_msstate()) ->
+                     {rabbit_types:ok(msg()) | 'not_found', client_msstate()}.
 
 read(MsgId,
      CState = #client_msstate { cur_file_cache_ets = CurFileCacheEts }) ->
@@ -545,11 +540,18 @@ read(MsgId,
             {{ok, Msg}, CState}
     end.
 
+-spec contains(rabbit_types:msg_id(), client_msstate()) -> boolean().
+
 contains(MsgId, CState) -> server_call(CState, {contains, MsgId}).
+
+-spec remove([rabbit_types:msg_id()], client_msstate()) -> 'ok'.
+
 remove([],    _CState) -> ok;
 remove(MsgIds, CState = #client_msstate { client_ref = CRef }) ->
     [client_update_flying(-1, MsgId, CState) || MsgId <- MsgIds],
     server_cast(CState, {remove, CRef, MsgIds}).
+
+-spec set_maximum_since_use(server(), non_neg_integer()) -> 'ok'.
 
 set_maximum_since_use(Server, Age) when is_pid(Server); is_atom(Server) ->
     gen_server2:cast(Server, {set_maximum_since_use, Age}).
@@ -594,7 +596,7 @@ client_read2(false, undefined, _MsgLocation, Defer, _CState) ->
     Defer();
 client_read2(true, _Right, _MsgLocation, Defer, _CState) ->
     %% Of course, in the mean time, the GC could have run and our msg
-    %% is actually in a different file, unlocked. However, defering is
+    %% is actually in a different file, unlocked. However, deferring is
     %% the safest and simplest thing to do.
     Defer();
 client_read2(false, _Right,
@@ -703,7 +705,7 @@ client_update_flying(Diff, MsgId, #client_msstate { flying_ets = FlyingEts,
 
 clear_client(CRef, State = #msstate { cref_to_msg_ids = CTM,
                                       dying_clients = DyingClients }) ->
-    State #msstate { cref_to_msg_ids = dict:erase(CRef, CTM),
+    State #msstate { cref_to_msg_ids = maps:remove(CRef, CTM),
                      dying_clients = maps:remove(CRef, DyingClients) }.
 
 
@@ -740,7 +742,7 @@ init([Type, BaseDir, ClientRefs, StartupFunState]) ->
     {CleanShutdown, IndexState, ClientRefs1} =
         recover_index_and_client_refs(IndexModule, FileSummaryRecovered,
                                       ClientRefs, Dir, Name),
-    Clients = dict:from_list(
+    Clients = maps:from_list(
                 [{CRef, {undefined, undefined, undefined}} ||
                     CRef <- ClientRefs1]),
     %% CleanShutdown => msg location index and file_summary both
@@ -776,11 +778,11 @@ init([Type, BaseDir, ClientRefs, StartupFunState]) ->
                        index_state            = IndexState,
                        current_file           = 0,
                        current_file_handle    = undefined,
-                       file_handle_cache      = dict:new(),
+                       file_handle_cache      = #{},
                        sync_timer_ref         = undefined,
                        sum_valid_data         = 0,
                        sum_file_size          = 0,
-                       pending_gc_completion  = orddict:new(),
+                       pending_gc_completion  = maps:new(),
                        gc_pid                 = GCPid,
                        file_handles_ets       = FileHandlesEts,
                        file_summary_ets       = FileSummaryEts,
@@ -790,7 +792,7 @@ init([Type, BaseDir, ClientRefs, StartupFunState]) ->
                        clients                = Clients,
                        successfully_recovered = CleanShutdown,
                        file_size_limit        = FileSizeLimit,
-                       cref_to_msg_ids        = dict:new(),
+                       cref_to_msg_ids        = #{},
                        credit_disc_bound      = CreditDiscBound
                      },
     %% If we didn't recover the msg location index then we need to
@@ -843,7 +845,7 @@ handle_call({new_client_state, CRef, CPid, MsgOnDiskFun, CloseFDsFun}, _From,
                                flying_ets         = FlyingEts,
                                clients            = Clients,
                                gc_pid             = GCPid }) ->
-    Clients1 = dict:store(CRef, {CPid, MsgOnDiskFun, CloseFDsFun}, Clients),
+    Clients1 = maps:put(CRef, {CPid, MsgOnDiskFun, CloseFDsFun}, Clients),
     erlang:monitor(process, CPid),
     reply({IndexState, IndexModule, Dir, GCPid, FileHandlesEts, FileSummaryEts,
            CurFileCacheEts, FlyingEts},
@@ -874,7 +876,7 @@ handle_cast({client_dying, CRef},
 
 handle_cast({client_delete, CRef},
             State = #msstate { clients = Clients }) ->
-    State1 = State #msstate { clients = dict:erase(CRef, Clients) },
+    State1 = State #msstate { clients = maps:remove(CRef, Clients) },
     noreply(clear_client(CRef, State1));
 
 handle_cast({write, CRef, MsgId, Flow},
@@ -882,7 +884,7 @@ handle_cast({write, CRef, MsgId, Flow},
                                clients            = Clients,
                                credit_disc_bound  = CreditDiscBound }) ->
     case Flow of
-        flow   -> {CPid, _, _} = dict:fetch(CRef, Clients),
+        flow   -> {CPid, _, _} = maps:get(CRef, Clients),
                   %% We are going to process a message sent by the
                   %% rabbit_amqqueue_process. Now we are accessing the
                   %% msg_store process dictionary.
@@ -1003,14 +1005,14 @@ terminate(_Reason, State = #msstate { index_state         = IndexState,
     [true = ets:delete(T) || T <- [FileSummaryEts, FileHandlesEts,
                                    CurFileCacheEts, FlyingEts]],
     IndexModule:terminate(IndexState),
-    case store_recovery_terms([{client_refs, dict:fetch_keys(Clients)},
+    case store_recovery_terms([{client_refs, maps:keys(Clients)},
                                {index_module, IndexModule}], Dir) of
         ok           ->
             rabbit_log:info("Message store for directory '~s' is stopped", [Dir]),
             ok;
         {error, RTErr} ->
             rabbit_log:error("Unable to save message store recovery terms"
-                             "for directory ~p~nError: ~p~n",
+                             " for directory ~p~nError: ~p~n",
                              [Dir, RTErr])
     end,
     State3 #msstate { index_state         = undefined,
@@ -1035,12 +1037,12 @@ reply(Reply, State) ->
 
 next_state(State = #msstate { sync_timer_ref  = undefined,
                               cref_to_msg_ids = CTM }) ->
-    case dict:size(CTM) of
+    case maps:size(CTM) of
         0 -> {State, hibernate};
         _ -> {start_sync_timer(State), 0}
     end;
 next_state(State = #msstate { cref_to_msg_ids = CTM }) ->
-    case dict:size(CTM) of
+    case maps:size(CTM) of
         0 -> {stop_sync_timer(State), hibernate};
         _ -> {State, 0}
     end.
@@ -1055,7 +1057,7 @@ stop_sync_timer(State) ->
 internal_sync(State = #msstate { current_file_handle = CurHdl,
                                  cref_to_msg_ids     = CTM }) ->
     State1 = stop_sync_timer(State),
-    CGs = dict:fold(fun (CRef, MsgIds, NS) ->
+    CGs = maps:fold(fun (CRef, MsgIds, NS) ->
                             case gb_sets:is_empty(MsgIds) of
                                 true  -> NS;
                                 false -> [{CRef, MsgIds} | NS]
@@ -1269,7 +1271,7 @@ contains_message(MsgId, From,
             gen_server2:reply(From, false),
             State;
         #msg_location { file = File } ->
-            case orddict:is_key(File, Pending) of
+            case maps:is_key(File, Pending) of
                 true  -> add_to_pending_gc_completion(
                            {contains, MsgId, From}, File, State);
                 false -> gen_server2:reply(From, true),
@@ -1280,16 +1282,16 @@ contains_message(MsgId, From,
 add_to_pending_gc_completion(
   Op, File, State = #msstate { pending_gc_completion = Pending }) ->
     State #msstate { pending_gc_completion =
-                         rabbit_misc:orddict_cons(File, Op, Pending) }.
+                         rabbit_misc:maps_cons(File, Op, Pending) }.
 
 run_pending(Files, State) ->
     lists:foldl(
       fun (File, State1 = #msstate { pending_gc_completion = Pending }) ->
-              Pending1 = orddict:erase(File, Pending),
+              Pending1 = maps:remove(File, Pending),
               lists:foldl(
                 fun run_pending_action/2,
                 State1 #msstate { pending_gc_completion = Pending1 },
-                lists:reverse(orddict:fetch(File, Pending)))
+                lists:reverse(maps:get(File, Pending)))
       end, State, Files).
 
 run_pending_action({read, MsgId, From}, State) ->
@@ -1320,14 +1322,14 @@ adjust_valid_total_size(File, Delta, State = #msstate {
                              [{#file_summary.valid_total_size, Delta}]),
     State #msstate { sum_valid_data = SumValid + Delta }.
 
-orddict_store(Key, Val, Dict) ->
-    false = orddict:is_key(Key, Dict),
-    orddict:store(Key, Val, Dict).
+maps_store(Key, Val, Dict) ->
+    false = maps:is_key(Key, Dict),
+    maps:put(Key, Val, Dict).
 
 update_pending_confirms(Fun, CRef,
                         State = #msstate { clients         = Clients,
                                            cref_to_msg_ids = CTM }) ->
-    case dict:fetch(CRef, Clients) of
+    case maps:get(CRef, Clients) of
         {_CPid, undefined,    _CloseFDsFun} -> State;
         {_CPid, MsgOnDiskFun, _CloseFDsFun} -> CTM1 = Fun(MsgOnDiskFun, CTM),
                                                State #msstate {
@@ -1337,21 +1339,24 @@ update_pending_confirms(Fun, CRef,
 record_pending_confirm(CRef, MsgId, State) ->
     update_pending_confirms(
       fun (_MsgOnDiskFun, CTM) ->
-              dict:update(CRef, fun (MsgIds) -> gb_sets:add(MsgId, MsgIds) end,
-                          gb_sets:singleton(MsgId), CTM)
+            NewMsgIds = case maps:find(CRef, CTM) of
+                error        -> gb_sets:singleton(MsgId);
+                {ok, MsgIds} -> gb_sets:add(MsgId, MsgIds)
+            end,
+            maps:put(CRef, NewMsgIds, CTM)
       end, CRef, State).
 
 client_confirm(CRef, MsgIds, ActionTaken, State) ->
     update_pending_confirms(
       fun (MsgOnDiskFun, CTM) ->
-              case dict:find(CRef, CTM) of
+              case maps:find(CRef, CTM) of
                   {ok, Gs} -> MsgOnDiskFun(gb_sets:intersection(Gs, MsgIds),
                                            ActionTaken),
                               MsgIds1 = rabbit_misc:gb_sets_difference(
                                           Gs, MsgIds),
                               case gb_sets:is_empty(MsgIds1) of
-                                  true  -> dict:erase(CRef, CTM);
-                                  false -> dict:store(CRef, MsgIds1, CTM)
+                                  true  -> maps:remove(CRef, CTM);
+                                  false -> maps:put(CRef, MsgIds1, CTM)
                               end;
                   error    -> CTM
               end
@@ -1402,9 +1407,9 @@ close_handle(Key, State = #msstate { file_handle_cache = FHC }) ->
     State #msstate { file_handle_cache = close_handle(Key, FHC) };
 
 close_handle(Key, FHC) ->
-    case dict:find(Key, FHC) of
+    case maps:find(Key, FHC) of
         {ok, Hdl} -> ok = file_handle_cache:close(Hdl),
-                     dict:erase(Key, FHC);
+                     maps:remove(Key, FHC);
         error     -> FHC
     end.
 
@@ -1419,7 +1424,7 @@ mark_handle_to_close(ClientRefs, FileHandlesEts, File, Invoke) ->
     [ begin
           case (ets:update_element(FileHandlesEts, Key, {2, close})
                 andalso Invoke) of
-              true  -> case dict:fetch(Ref, ClientRefs) of
+              true  -> case maps:get(Ref, ClientRefs) of
                            {_CPid, _MsgOnDiskFun, undefined} ->
                                ok;
                            {_CPid, _MsgOnDiskFun, CloseFDsFun} ->
@@ -1444,6 +1449,9 @@ safe_file_delete(File, Dir, FileHandlesEts) ->
                           true
     end.
 
+-spec close_all_indicated
+        (client_msstate()) -> rabbit_types:ok(client_msstate()).
+
 close_all_indicated(#client_msstate { file_handles_ets = FileHandlesEts,
                                       client_ref       = Ref } =
                         CState) ->
@@ -1456,16 +1464,16 @@ close_all_indicated(#client_msstate { file_handles_ets = FileHandlesEts,
 close_all_handles(CState = #client_msstate { file_handles_ets  = FileHandlesEts,
                                              file_handle_cache = FHC,
                                              client_ref        = Ref }) ->
-    ok = dict:fold(fun (File, Hdl, ok) ->
+    ok = maps:fold(fun (File, Hdl, ok) ->
                            true = ets:delete(FileHandlesEts, {Ref, File}),
                            file_handle_cache:close(Hdl)
                    end, ok, FHC),
-    CState #client_msstate { file_handle_cache = dict:new() };
+    CState #client_msstate { file_handle_cache = #{} };
 
 close_all_handles(State = #msstate { file_handle_cache = FHC }) ->
-    ok = dict:fold(fun (_Key, Hdl, ok) -> file_handle_cache:close(Hdl) end,
+    ok = maps:fold(fun (_Key, Hdl, ok) -> file_handle_cache:close(Hdl) end,
                    ok, FHC),
-    State #msstate { file_handle_cache = dict:new() }.
+    State #msstate { file_handle_cache = #{} }.
 
 get_read_handle(FileNum, CState = #client_msstate { file_handle_cache = FHC,
                                                     dir = Dir }) ->
@@ -1478,11 +1486,11 @@ get_read_handle(FileNum, State = #msstate { file_handle_cache = FHC,
     {Hdl, State #msstate { file_handle_cache = FHC2 }}.
 
 get_read_handle(FileNum, FHC, Dir) ->
-    case dict:find(FileNum, FHC) of
+    case maps:find(FileNum, FHC) of
         {ok, Hdl} -> {Hdl, FHC};
         error     -> {ok, Hdl} = open_file(Dir, filenum_to_name(FileNum),
                                            ?READ_MODE),
-                     {Hdl, dict:store(FileNum, Hdl, FHC)}
+                     {Hdl, maps:put(FileNum, Hdl, FHC)}
     end.
 
 preallocate(Hdl, FileSizeLimit, FinalPos) ->
@@ -1762,8 +1770,12 @@ build_index(Gatherer, Left, [],
 build_index(Gatherer, Left, [File|Files], State) ->
     ok = gatherer:fork(Gatherer),
     ok = worker_pool:submit_async(
-           fun () -> build_index_worker(Gatherer, State,
-                                        Left, File, Files)
+           fun () ->
+                link(Gatherer),
+                ok = build_index_worker(Gatherer, State,
+                                   Left, File, Files),
+                unlink(Gatherer),
+                ok
            end),
     build_index(Gatherer, File, Files, State).
 
@@ -1853,7 +1865,7 @@ maybe_compact(State = #msstate { sum_valid_data        = SumValid,
     %% complete traversal of FileSummaryEts.
     First = ets:first(FileSummaryEts),
     case First =:= '$end_of_table' orelse
-        orddict:size(Pending) >= ?MAXIMUM_SIMULTANEOUS_GC_FILES of
+        maps:size(Pending) >= ?MAXIMUM_SIMULTANEOUS_GC_FILES of
         true ->
             State;
         false ->
@@ -1862,8 +1874,8 @@ maybe_compact(State = #msstate { sum_valid_data        = SumValid,
                 not_found ->
                     State;
                 {Src, Dst} ->
-                    Pending1 = orddict_store(Dst, [],
-                                             orddict_store(Src, [], Pending)),
+                    Pending1 = maps_store(Dst, [],
+                                             maps_store(Src, [], Pending)),
                     State1 = close_handle(Src, close_handle(Dst, State)),
                     true = ets:update_element(FileSummaryEts, Src,
                                               {#file_summary.locked, true}),
@@ -1919,7 +1931,7 @@ delete_file_if_empty(File, State = #msstate {
         0 -> true = ets:update_element(FileSummaryEts, File,
                                        {#file_summary.locked, true}),
              ok = rabbit_msg_store_gc:delete(GCPid, File),
-             Pending1 = orddict_store(File, [], Pending),
+             Pending1 = maps_store(File, [], Pending),
              close_handle(File,
                           State #msstate { pending_gc_completion = Pending1 });
         _ -> State
@@ -1958,10 +1970,15 @@ cleanup_after_file_deletion(File,
 %% garbage collection / compaction / aggregation -- external
 %%----------------------------------------------------------------------------
 
+-spec has_readers(non_neg_integer(), gc_state()) -> boolean().
+
 has_readers(File, #gc_state { file_summary_ets = FileSummaryEts }) ->
     [#file_summary { locked = true, readers = Count }] =
         ets:lookup(FileSummaryEts, File),
     Count /= 0.
+
+-spec combine_files(non_neg_integer(), non_neg_integer(), gc_state()) ->
+                              deletion_thunk().
 
 combine_files(Source, Destination,
               State = #gc_state { file_summary_ets = FileSummaryEts,
@@ -2038,6 +2055,8 @@ combine_files(Source, Destination,
     Reclaimed = SourceFileSize + DestinationFileSize - TotalValidData,
     gen_server2:cast(Server, {combine_files, Source, Destination, Reclaimed}),
     safe_file_delete_fun(Source, Dir, FileHandlesEts).
+
+-spec delete_file(non_neg_integer(), gc_state()) -> deletion_thunk().
 
 delete_file(File, State = #gc_state { file_summary_ets = FileSummaryEts,
                                       file_handles_ets = FileHandlesEts,
@@ -2120,6 +2139,8 @@ copy_messages(WorkList, InitOffset, FinalOffset, SourceHdl, DestinationHdl,
                         {destination, Destination}]}
     end.
 
+-spec force_recovery(file:filename(), server()) -> 'ok'.
+
 force_recovery(BaseDir, Store) ->
     Dir = filename:join(BaseDir, atom_to_list(Store)),
     case file:delete(filename:join(Dir, ?CLEAN_FILENAME)) of
@@ -2134,6 +2155,9 @@ foreach_file(D, Fun, Files) ->
 
 foreach_file(D1, D2, Fun, Files) ->
     [ok = Fun(filename:join(D1, File), filename:join(D2, File)) || File <- Files].
+
+-spec transform_dir(file:filename(), server(),
+        fun ((any()) -> (rabbit_types:ok_or_error2(msg(), any())))) -> 'ok'.
 
 transform_dir(BaseDir, Store, TransformFun) ->
     Dir = filename:join(BaseDir, atom_to_list(Store)),

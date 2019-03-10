@@ -7,7 +7,8 @@
          update_app_config/1,
          schema_dir/0,
          config_files/0,
-         get_advanced_config/0
+         get_advanced_config/0,
+         validate_config_files/0
         ]).
 
 prepare_and_use_config() ->
@@ -33,25 +34,25 @@ prepare_and_use_config() ->
 legacy_erlang_term_config_used() ->
     case init:get_argument(config) of
         error        -> false;
-        {ok, [Config | _]} -> 
+        {ok, [Config | _]} ->
             ConfigFile = Config ++ ".config",
-            rabbit_file:is_file(ConfigFile) 
-            andalso 
+            rabbit_file:is_file(ConfigFile)
+            andalso
             get_advanced_config() == none
     end.
 
 get_confs() ->
     case init:get_argument(conf) of
-        {ok, Configs} -> Configs;
-        _             -> []
+        {ok, Confs} -> [ filename:rootname(Conf, ".conf") ++ ".conf"
+                         || Conf <- Confs ];
+        _           -> []
     end.
 
-prepare_config(Configs) ->
+prepare_config(Confs) ->
     case {init:get_argument(conf_dir), init:get_argument(conf_script_dir)} of
         {{ok, ConfDir}, {ok, ScriptDir}} ->
-            ConfFiles = [Config ++ ".conf" || [Config] <- Configs,
-                                            rabbit_file:is_file(Config ++
-                                                                    ".conf")],
+            ConfFiles = [Conf || Conf <- Confs,
+                                 rabbit_file:is_file(Conf)],
             case ConfFiles of
                 [] -> ok;
                 _  ->
@@ -66,16 +67,71 @@ prepare_config(Configs) ->
     end.
 
 update_app_config(ConfigFile) ->
-    ok = application_controller:change_application_data([], [ConfigFile]).
+    RunningApps = [ App || {App, _, _} <- application:which_applications() ],
+    LoadedApps = [ App || {App, _, _} <- application:loaded_applications() ],
+    {ok, [Config]} = file:consult(ConfigFile),
+    %% For application config to be updated, applications should
+    %% be unloaded first.
+    %% If an application is already running, print an error.
+    lists:foreach(fun({App, AppConfig}) ->
+        case lists:member(App, RunningApps) of
+            true ->
+                maybe_print_warning_for_running_app(App, AppConfig);
+            false ->
+                case lists:member(App, LoadedApps) of
+                    true  -> application:unload(App);
+                    false -> ok
+                end
+        end
+    end,
+    Config),
+    maybe_set_net_ticktime(proplists:get_value(kernel, Config)),
+    ok = application_controller:change_application_data([], [ConfigFile]),
+    %% Make sure to load all the applications we're unloaded
+    lists:foreach(fun(App) -> application:load(App) end, LoadedApps),
+    ok.
+
+maybe_print_warning_for_running_app(kernel, Config) ->
+    ConfigWithoutSupportedEntry = proplists:delete(net_ticktime, Config),
+    case length(ConfigWithoutSupportedEntry) > 0 of
+        true -> io:format(standard_error,
+            "~nUnable to update config for app ~p from a .conf file."
+            " The app is already running. Use advanced.config instead.~n", [kernel]);
+        false -> ok
+    end;
+maybe_print_warning_for_running_app(App, _Config) ->
+    io:format(standard_error,
+        "~nUnable to update config for app ~p from a .conf file: "
+        " The app is already running.~n",
+        [App]).
+
+maybe_set_net_ticktime(undefined) ->
+    ok;
+maybe_set_net_ticktime(KernelConfig) ->
+    case proplists:get_value(net_ticktime, KernelConfig) of
+        undefined ->
+            ok;
+        NetTickTime ->
+            case net_kernel:set_net_ticktime(NetTickTime, 0) of
+                unchanged ->
+                    ok;
+                change_initiated ->
+                    ok;
+                {ongoing_change_to, NewNetTicktime} ->
+                    io:format(standard_error,
+                        "~nCouldn't set net_ticktime to ~p "
+                        "as net_kernel is busy changing net_ticktime to ~p seconds ~n",
+                        [NetTickTime, NewNetTicktime])
+            end
+    end.
 
 generate_config_file(ConfFiles, ConfDir, ScriptDir) ->
-    generate_config_file(ConfFiles, ConfDir, ScriptDir, 
+    generate_config_file(ConfFiles, ConfDir, ScriptDir,
                          schema_dir(), get_advanced_config()).
 
 
 generate_config_file(ConfFiles, ConfDir, ScriptDir, SchemaDir, Advanced) ->
     prepare_plugin_schemas(SchemaDir),
-    % SchemaFile = filename:join([ScriptDir, "rabbitmq.schema"]),
     Cuttlefish = filename:join([ScriptDir, "cuttlefish"]),
     GeneratedDir = filename:join([ConfDir, "generated"]),
 
@@ -121,9 +177,8 @@ get_advanced_config() ->
     case init:get_argument(conf_advanced) of
         %% There can be only one advanced.config
         {ok, [FileName | _]} ->
-            ConfigName = FileName ++ ".config",
-            case rabbit_file:is_file(ConfigName) of
-                true  -> ConfigName;
+            case rabbit_file:is_file(FileName) of
+                true  -> FileName;
                 false -> none
             end;
         _ -> none
@@ -136,25 +191,25 @@ prepare_plugin_schemas(SchemaDir) ->
         false -> ok
     end.
 
-
 config_files() ->
-    Abs = fun (F, Ex) -> filename:absname(filename:rootname(F, Ex) ++ Ex) end,
     case legacy_erlang_term_config_used() of
         true ->
             case init:get_argument(config) of
-                {ok, Files} -> [Abs(File, ".config") || [File] <- Files];
+                {ok, Files} -> [ filename:absname(filename:rootname(File) ++ ".config")
+                                 || [File] <- Files];
                 error       -> case config_setting() of
                                    none -> [];
-                                   File -> [Abs(File, ".config") 
-                                            ++ 
+                                   File -> [filename:absname(filename:rootname(File, ".config") ++ ".config")
+                                            ++
                                             " (not found)"]
                                end
             end;
         false ->
-            ConfFiles = [Abs(File, ".conf") || File <- get_confs()],
+            ConfFiles = [filename:absname(File) || File <- get_confs(),
+                                                   filelib:is_regular(File)],
             AdvancedFiles = case get_advanced_config() of
                 none -> [];
-                FileName -> [Abs(FileName, ".config")]
+                FileName -> [filename:absname(FileName)]
             end,
             AdvancedFiles ++ ConfFiles
 
@@ -177,3 +232,89 @@ config_setting() ->
                        end
     end.
 
+-spec validate_config_files() -> ok | {error, {Fmt :: string(), Args :: list()}}.
+validate_config_files() ->
+    ConfigFile = os:getenv("RABBITMQ_CONFIG_FILE"),
+    AdvancedConfigFile = get_advanced_config(),
+    AssertConfig = case filename:extension(ConfigFile) of
+        ".config" -> assert_config(ConfigFile, "RABBITMQ_CONFIG_FILE");
+        ".conf"   -> assert_conf(ConfigFile, "RABBITMQ_CONFIG_FILE");
+        _ -> ok
+    end,
+    case AssertConfig of
+        ok ->
+            assert_config(AdvancedConfigFile, "RABBITMQ_ADVANCED_CONFIG_FILE");
+        {error, Err} ->
+            {error, Err}
+    end.
+
+assert_config("", _) -> ok;
+assert_config(none, _) -> ok;
+assert_config(Filename, Env) ->
+    assert_config(filename:extension(Filename), Filename, Env).
+
+-define(ERRMSG_INDENT, "                                ").
+
+assert_config(".config", Filename, Env) ->
+    case filelib:is_regular(Filename) of
+        true ->
+            case file:consult(Filename) of
+                {ok, []}    -> {error,
+                                {"Config file ~s should not be empty: ~s",
+                                 [Env, Filename]}};
+                {ok, [_]}   -> ok;
+                {ok, [_|_]} -> {error,
+                                {"Config file ~s must contain ONE list ended by <dot>: ~s",
+                                 [Env, Filename]}};
+                {error, {1, erl_parse, Err}} ->
+                    % Note: the sequence of spaces is to indent from the [error] prefix, like this:
+                    %
+                    % 2018-09-06 07:05:40.225 [error] Unable to parse erlang terms from RABBITMQ_ADVANCED_CONFIG_FILE...
+                    %                                 Reason: ["syntax error before: ",[]]
+                    {error, {"Unable to parse erlang terms from ~s file: ~s~n"
+                             ?ERRMSG_INDENT
+                             "Reason: ~p~n"
+                             ?ERRMSG_INDENT
+                             "Check that the file is in erlang term format. " ++
+                             case Env of
+                                "RABBITMQ_CONFIG_FILE" ->
+                                    "If you are using the new ini-style format, the file extension should be '.conf'~n";
+                                _ -> ""
+                             end,
+                             [Env, Filename, Err]}};
+                {error, Err} ->
+                    {error, {"Unable to parse erlang terms from  ~s file: ~s~n"
+                             ?ERRMSG_INDENT
+                             "Error: ~p~n",
+                             [Env, Filename, Err]}}
+            end;
+        false ->
+            ok
+    end;
+assert_config(BadExt, Filename, Env) ->
+    {error, {"'~s': Expected extension '.config', got extension '~s' for file '~s'~n", [Env, BadExt, Filename]}}.
+
+assert_conf("", _) -> ok;
+assert_conf(Filename, Env) ->
+    assert_conf(filename:extension(Filename), Filename, Env).
+
+assert_conf(".conf", Filename, Env) ->
+    case filelib:is_regular(Filename) of
+        true ->
+            case file:consult(Filename) of
+                {ok, []} -> ok;
+                {ok, _}  ->
+                    {error, {"Wrong format of the config file ~s: ~s~n"
+                             ?ERRMSG_INDENT
+                             "Check that the file is in the new ini-style config format. "
+                             "If you are using the old format the file extension should "
+                             "be .config~n",
+                             [Env, Filename]}};
+                _ ->
+                    ok
+            end;
+        false ->
+            ok
+    end;
+assert_conf(BadExt, Filename, Env) ->
+    {error, {"'~s': Expected extension '.config', got extension '~s' for file '~s'~n", [Env, BadExt, Filename]}}.

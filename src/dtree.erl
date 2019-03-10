@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 %% A dual-index tree.
@@ -32,7 +32,7 @@
 
 -module(dtree).
 
--export([empty/0, insert/4, take/3, take/2, take_all/2, drop/2,
+-export([empty/0, insert/4, take/3, take/2, take_one/2, take_all/2, drop/2,
          is_defined/2, is_empty/1, smallest/1, size/1]).
 
 %%----------------------------------------------------------------------------
@@ -46,23 +46,17 @@
 -type val()        :: any().
 -type kv()         :: {pk(), val()}.
 
--spec empty() -> ?MODULE().
--spec insert(pk(), [sk()], val(), ?MODULE()) -> ?MODULE().
--spec take([pk()], sk(), ?MODULE()) -> {[kv()], ?MODULE()}.
--spec take(sk(), ?MODULE()) -> {[kv()], ?MODULE()}.
--spec take_all(sk(), ?MODULE()) -> {[kv()], ?MODULE()}.
--spec drop(pk(), ?MODULE()) -> ?MODULE().
--spec is_defined(sk(), ?MODULE()) -> boolean().
--spec is_empty(?MODULE()) -> boolean().
--spec smallest(?MODULE()) -> kv().
--spec size(?MODULE()) -> non_neg_integer().
-
 %%----------------------------------------------------------------------------
+
+-spec empty() -> ?MODULE().
 
 empty() -> {gb_trees:empty(), gb_trees:empty()}.
 
 %% Insert an entry. Fails if there already is an entry with the given
 %% primary key.
+
+-spec insert(pk(), [sk()], val(), ?MODULE()) -> ?MODULE().
+
 insert(PK, [], V, {P, S}) ->
     %% dummy insert to force error if PK exists
     _ = gb_trees:insert(PK, {gb_sets:empty(), V}, P),
@@ -83,6 +77,9 @@ insert(PK, SKs, V, {P, S}) ->
 %% that were dropped as the result (i.e. due to their secondary key
 %% set becoming empty). It is ok for the given primary keys and/or
 %% secondary key to not exist.
+
+-spec take([pk()], sk(), ?MODULE()) -> {[kv()], ?MODULE()}.
+
 take(PKs, SK, {P, S}) ->
     case gb_trees:lookup(SK, S) of
         none         -> {[], {P, S}};
@@ -100,6 +97,9 @@ take(PKs, SK, {P, S}) ->
 %% primary-key/value pairs of any entries that were dropped as the
 %% result (i.e. due to their secondary key set becoming empty). It is
 %% ok for the given secondary key to not exist.
+
+-spec take(sk(), ?MODULE()) -> {[kv()], ?MODULE()}.
+
 take(SK, {P, S}) ->
     case gb_trees:lookup(SK, S) of
         none         -> {[], {P, S}};
@@ -107,9 +107,35 @@ take(SK, {P, S}) ->
                         {KVs, {P1, gb_trees:delete(SK, S)}}
     end.
 
+%% Drop an entry with the primary key and clears secondary keys for this key,
+%% returning a list with a key-value pair as a result.
+%% If the primary key does not exist, returns an empty list.
+
+-spec take_one(pk(), ?MODULE()) -> {[{pk(), val()}], ?MODULE()}.
+
+take_one(PK, {P, S}) ->
+    case gb_trees:lookup(PK, P) of
+        {value, {SKS, Value}} ->
+            P1 = gb_trees:delete(PK, P),
+            S1 = gb_sets:fold(
+                    fun(SK, Acc) ->
+                        {value, PKS} = gb_trees:lookup(SK, Acc),
+                        PKS1 = gb_sets:delete(PK, PKS),
+                        case gb_sets:is_empty(PKS1) of
+                            true  -> gb_trees:delete(SK, Acc);
+                            false -> gb_trees:update(SK, PKS1, Acc)
+                        end
+                    end, S, SKS),
+            {[{PK, Value}], {P1, S1}};
+        none -> {[], {P, S}}
+    end.
+
 %% Drop all entries which contain the given secondary key, returning
 %% the primary-key/value pairs of these entries. It is ok for the
 %% given secondary key to not exist.
+
+-spec take_all(sk(), ?MODULE()) -> {[kv()], ?MODULE()}.
+
 take_all(SK, {P, S}) ->
     case gb_trees:lookup(SK, S) of
         none         -> {[], {P, S}};
@@ -118,6 +144,9 @@ take_all(SK, {P, S}) ->
     end.
 
 %% Drop all entries for the given primary key (which does not have to exist).
+
+-spec drop(pk(), ?MODULE()) -> ?MODULE().
+
 drop(PK, {P, S}) ->
     case gb_trees:lookup(PK, P) of
         none               -> {P, S};
@@ -125,12 +154,20 @@ drop(PK, {P, S}) ->
                                prune(SKS, gb_sets:singleton(PK), S)}
     end.
 
+-spec is_defined(sk(), ?MODULE()) -> boolean().
+
 is_defined(SK, {_P, S}) -> gb_trees:is_defined(SK, S).
+
+-spec is_empty(?MODULE()) -> boolean().
 
 is_empty({P, _S}) -> gb_trees:is_empty(P).
 
+-spec smallest(?MODULE()) -> kv().
+
 smallest({P, _S}) -> {K, {_SKS, V}} = gb_trees:smallest(P),
                      {K, V}.
+
+-spec size(?MODULE()) -> non_neg_integer().
 
 size({P, _S}) -> gb_trees:size(P).
 

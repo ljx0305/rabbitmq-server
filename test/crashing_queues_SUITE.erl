@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(crashing_queues_SUITE).
@@ -217,13 +217,20 @@ kill_queue(Node, QName) ->
     await_new_pid(Node, QName, Pid1).
 
 queue_pid(Node, QName) ->
-    #amqqueue{pid   = QPid,
-              state = State} = lookup(Node, QName),
+    Q = lookup(Node, QName),
+    QPid = amqqueue:get_pid(Q),
+    State = amqqueue:get_state(Q),
+    #resource{virtual_host = VHost} = amqqueue:get_name(Q),
     case State of
-        crashed -> case sup_child(Node, rabbit_amqqueue_sup_sup) of
+        crashed ->
+            case rabbit_amqqueue_sup_sup:find_for_vhost(VHost, Node) of
+                {error, {queue_supervisor_not_found, _}} -> {error, no_sup};
+                {ok, SPid} ->
+                    case sup_child(Node, SPid) of
                        {ok, _}           -> QPid;   %% restarting
                        {error, no_child} -> crashed %% given up
-                   end;
+                    end
+            end;
         _       -> QPid
     end.
 

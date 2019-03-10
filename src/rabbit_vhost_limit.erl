@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_vhost_limit).
@@ -26,7 +26,8 @@
 -export([update_limit/4, clear_limit/3, get_limit/2]).
 -export([validate/5, notify/5, notify_clear/4]).
 -export([connection_limit/1, queue_limit/1,
-    is_over_queue_limit/1, is_over_connection_limit/1]).
+    is_over_queue_limit/1, would_exceed_queue_limit/2,
+    is_over_connection_limit/1]).
 
 -import(rabbit_misc, [pget/2, pget/3]).
 
@@ -54,7 +55,12 @@ notify(VHost, <<"vhost-limits">>, <<"limits">>, Limits, ActingUser) ->
 notify_clear(VHost, <<"vhost-limits">>, <<"limits">>, ActingUser) ->
     rabbit_event:notify(vhost_limits_cleared, [{name, <<"limits">>},
                                                {user_who_performed_action, ActingUser}]),
-    update_vhost(VHost, undefined).
+    %% If the function is called as a part of vhost deletion, the vhost can
+    %% be already deleted.
+    case rabbit_vhost:exists(VHost) of
+        true  -> update_vhost(VHost, undefined);
+        false -> ok
+    end.
 
 connection_limit(VirtualHost) ->
     get_limit(VirtualHost, <<"max-connections">>).
@@ -106,28 +112,40 @@ is_over_connection_limit(VirtualHost) ->
         {ok, _Limit}                                         -> false
     end.
 
+-spec would_exceed_queue_limit(non_neg_integer(), rabbit_types:vhost()) ->
+    {true, non_neg_integer(), non_neg_integer()} | false.
+
+would_exceed_queue_limit(AdditionalCount, VirtualHost) ->
+    case queue_limit(VirtualHost) of
+        undefined ->
+            %% no limit configured
+            false;
+        {ok, 0} ->
+            %% with limit = 0, no queues can be declared (perhaps not very
+            %% useful but consistent with the connection limit)
+            {true, 0, 0};
+        {ok, Limit} when is_integer(Limit) andalso Limit > 0 ->
+            QueueCount = rabbit_amqqueue:count(VirtualHost),
+            case (AdditionalCount + QueueCount) > Limit of
+                false -> false;
+                true  -> {true, Limit, QueueCount}
+            end;
+        {ok, Limit} when is_integer(Limit) andalso Limit < 0 ->
+            %% any negative value means "no limit". Note that parameter validation
+            %% will replace negative integers with 'undefined', so this is to be
+            %% explicit and extra defensive
+            false;
+        {ok, _Limit} ->
+            %% ignore non-integer limits
+            false
+    end.
 
 -spec is_over_queue_limit(rabbit_types:vhost()) -> {true, non_neg_integer()} | false.
 
 is_over_queue_limit(VirtualHost) ->
-    case queue_limit(VirtualHost) of
-        %% no limit configured
-        undefined                                            -> false;
-        %% with limit = 0, no queues can be declared (perhaps not very
-        %% useful but consistent with the connection limit)
-        {ok, 0}                                              -> {true, 0};
-        {ok, Limit} when is_integer(Limit) andalso Limit > 0 ->
-            QueueCount = rabbit_amqqueue:count(VirtualHost),
-            case QueueCount >= Limit of
-                false -> false;
-                true  -> {true, Limit}
-            end;
-        %% any negative value means "no limit". Note that parameter validation
-        %% will replace negative integers with 'undefined', so this is to be
-        %% explicit and extra defensive
-        {ok, Limit} when is_integer(Limit) andalso Limit < 0 -> false;
-        %% ignore non-integer limits
-        {ok, _Limit}                                         -> false
+    case would_exceed_queue_limit(1, VirtualHost) of
+        {true, Limit, _QueueCount} -> {true, Limit};
+        false -> false
     end.
 
 %%----------------------------------------------------------------------------

@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_amqqueue_sup).
@@ -26,10 +26,8 @@
 
 %%----------------------------------------------------------------------------
 
--spec start_link(rabbit_types:amqqueue(), rabbit_prequeue:start_mode()) ->
+-spec start_link(amqqueue:amqqueue(), rabbit_prequeue:start_mode()) ->
           {'ok', pid(), pid()}.
-
-%%----------------------------------------------------------------------------
 
 start_link(Q, StartMode) ->
     Marker = spawn_link(fun() -> receive stop -> ok end end),

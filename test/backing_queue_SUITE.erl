@@ -11,20 +11,22 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2011-2017 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2011-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(backing_queue_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
+-include("amqqueue.hrl").
 
 -compile(export_all).
 
--define(PERSISTENT_MSG_STORE, msg_store_persistent_vhost).
--define(TRANSIENT_MSG_STORE,  msg_store_transient_vhost).
+-define(PERSISTENT_MSG_STORE, msg_store_persistent).
+-define(TRANSIENT_MSG_STORE,  msg_store_transient).
 
 -define(TIMEOUT, 30000).
+-define(VHOST, <<"/">>).
 
 -define(VARIABLE_QUEUE_TESTCASES, [
     variable_queue_dynamic_duration_change,
@@ -253,9 +255,9 @@ msg_store1(_Config) ->
     MSCState4 = msg_store_read(MsgIds2ndHalf, MSCState3),
     ok = rabbit_msg_store:client_terminate(MSCState4),
     %% stop and restart, preserving every other msg in 2nd half
-    ok = rabbit_variable_queue:stop_msg_store(),
-    ok = rabbit_variable_queue:start_msg_store(
-           #{}, {fun ([]) -> finished;
+    ok = rabbit_variable_queue:stop_msg_store(?VHOST),
+    ok = rabbit_variable_queue:start_msg_store(?VHOST,
+           [], {fun ([]) -> finished;
                     ([MsgId|MsgIdsTail])
                       when length(MsgIdsTail) rem 2 == 0 ->
                         {MsgId, 1, MsgIdsTail};
@@ -330,8 +332,8 @@ msg_store1(_Config) ->
     passed.
 
 restart_msg_store_empty() ->
-    ok = rabbit_variable_queue:stop_msg_store(),
-    ok = rabbit_variable_queue:start_msg_store(
+    ok = rabbit_variable_queue:stop_msg_store(?VHOST),
+    ok = rabbit_variable_queue:start_msg_store(?VHOST,
            undefined, {fun (ok) -> finished end, ok}).
 
 msg_id_bin(X) ->
@@ -376,10 +378,10 @@ on_disk_stop(Pid) ->
 
 msg_store_client_init_capture(MsgStore, Ref) ->
     Pid = spawn(fun on_disk_capture/0),
-    {Pid, rabbit_msg_store_vhost_sup:client_init(
-            MsgStore, Ref, fun (MsgIds, _ActionTaken) ->
-                                   Pid ! {on_disk, MsgIds}
-                           end, undefined, <<"/">>)}.
+    {Pid, rabbit_vhost_msg_store:client_init(?VHOST, MsgStore, Ref,
+                                             fun (MsgIds, _ActionTaken) ->
+                                                 Pid ! {on_disk, MsgIds}
+                                             end, undefined)}.
 
 msg_store_contains(Atom, MsgIds, MSCState) ->
     Atom = lists:foldl(
@@ -456,14 +458,16 @@ test_msg_store_confirm_timer() ->
     Ref = rabbit_guid:gen(),
     MsgId  = msg_id_bin(1),
     Self = self(),
-    MSCState = rabbit_msg_store_vhost_sup:client_init(
-                 ?PERSISTENT_MSG_STORE, Ref,
-                 fun (MsgIds, _ActionTaken) ->
-                         case gb_sets:is_member(MsgId, MsgIds) of
-                             true  -> Self ! on_disk;
-                             false -> ok
-                         end
-                 end, undefined, <<"/">>),
+    MSCState = rabbit_vhost_msg_store:client_init(
+        ?VHOST,
+        ?PERSISTENT_MSG_STORE,
+        Ref,
+        fun (MsgIds, _ActionTaken) ->
+            case gb_sets:is_member(MsgId, MsgIds) of
+                true  -> Self ! on_disk;
+                false -> ok
+            end
+        end, undefined),
     ok = msg_store_write([MsgId], MSCState),
     ok = msg_store_keep_busy_until_confirm([msg_id_bin(2)], MSCState, false),
     ok = msg_store_remove([MsgId], MSCState),
@@ -651,8 +655,8 @@ bq_queue_index1(_Config) ->
               Qi8
       end),
 
-    ok = rabbit_variable_queue:stop(),
-    {ok, _} = rabbit_variable_queue:start([]),
+    ok = rabbit_variable_queue:stop(?VHOST),
+    {ok, _} = rabbit_variable_queue:start(?VHOST, []),
 
     passed.
 
@@ -672,8 +676,8 @@ bq_queue_index_props1(_Config) ->
               Qi2
       end),
 
-    ok = rabbit_variable_queue:stop(),
-    {ok, _} = rabbit_variable_queue:start([]),
+    ok = rabbit_variable_queue:stop(?VHOST),
+    {ok, _} = rabbit_variable_queue:start(?VHOST, []),
 
     passed.
 
@@ -683,11 +687,10 @@ bq_variable_queue_delete_msg_store_files_callback(Config) ->
 
 bq_variable_queue_delete_msg_store_files_callback1(Config) ->
     ok = restart_msg_store_empty(),
-    {new, #amqqueue { pid = QPid, name = QName } = Q} =
-      rabbit_amqqueue:declare(
-        queue_name(Config,
-          <<"bq_variable_queue_delete_msg_store_files_callback-q">>),
-        true, false, [], none, <<"acting-user">>),
+    QName0 = queue_name(Config, <<"bq_variable_queue_delete_msg_store_files_callback-q">>),
+    {new, Q} = rabbit_amqqueue:declare(QName0, true, false, [], none, <<"acting-user">>),
+    QName = amqqueue:get_name(Q),
+    QPid = amqqueue:get_pid(Q),
     Payload = <<0:8388608>>, %% 1MB
     Count = 30,
     publish_and_confirm(Q, Payload, Count),
@@ -698,7 +701,9 @@ bq_variable_queue_delete_msg_store_files_callback1(Config) ->
 
     CountMinusOne = Count - 1,
     {ok, CountMinusOne, {QName, QPid, _AckTag, false, _Msg}} =
-        rabbit_amqqueue:basic_get(Q, self(), true, Limiter),
+        rabbit_amqqueue:basic_get(Q, self(), true, Limiter,
+                                  <<"bq_variable_queue_delete_msg_store_files_callback1">>,
+                                  #{}),
     {ok, CountMinusOne} = rabbit_amqqueue:purge(Q),
 
     %% give the queue a second to receive the close_fds callback msg
@@ -713,12 +718,13 @@ bq_queue_recover(Config) ->
 
 bq_queue_recover1(Config) ->
     Count = 2 * rabbit_queue_index:next_segment_boundary(0),
-    {new, #amqqueue { pid = QPid, name = QName } = Q} =
-        rabbit_amqqueue:declare(queue_name(Config, <<"bq_queue_recover-q">>),
-                                true, false, [], none, <<"acting-user">>),
+    QName0 = queue_name(Config, <<"bq_queue_recover-q">>),
+    {new, Q} = rabbit_amqqueue:declare(QName0, true, false, [], none, <<"acting-user">>),
+    QName = amqqueue:get_name(Q),
+    QPid = amqqueue:get_pid(Q),
     publish_and_confirm(Q, <<>>, Count),
 
-    SupPid = rabbit_ct_broker_helpers:get_queue_sup_pid(QPid),
+    SupPid = get_queue_sup_pid(Q),
     true = is_pid(SupPid),
     exit(SupPid, kill),
     exit(QPid, kill),
@@ -726,15 +732,18 @@ bq_queue_recover1(Config) ->
     receive {'DOWN', MRef, process, QPid, _Info} -> ok
     after 10000 -> exit(timeout_waiting_for_queue_death)
     end,
-    rabbit_amqqueue:stop(),
-    rabbit_amqqueue:start(rabbit_amqqueue:recover()),
+    rabbit_amqqueue:stop(?VHOST),
+    {Recovered, [], []} = rabbit_amqqueue:recover(?VHOST),
+    rabbit_amqqueue:start(Recovered),
     {ok, Limiter} = rabbit_limiter:start_link(no_id),
     rabbit_amqqueue:with_or_die(
       QName,
-      fun (Q1 = #amqqueue { pid = QPid1 }) ->
+      fun (Q1) when ?is_amqqueue(Q1) ->
+              QPid1 = amqqueue:get_pid(Q1),
               CountMinusOne = Count - 1,
               {ok, CountMinusOne, {QName, QPid1, _AckTag, true, _Msg}} =
-                  rabbit_amqqueue:basic_get(Q1, self(), false, Limiter),
+                  rabbit_amqqueue:basic_get(Q1, self(), false, Limiter,
+                                            <<"bq_queue_recover1">>, #{}),
               exit(QPid1, shutdown),
               VQ1 = variable_queue_init(Q, true),
               {{_Msg1, true, _AckTag1}, VQ2} =
@@ -744,6 +753,24 @@ bq_queue_recover1(Config) ->
               ok = rabbit_amqqueue:internal_delete(QName, <<"acting-user">>)
       end),
     passed.
+
+%% Return the PID of the given queue's supervisor.
+get_queue_sup_pid(Q) when ?is_amqqueue(Q) ->
+    QName = amqqueue:get_name(Q),
+    QPid = amqqueue:get_pid(Q),
+    VHost = QName#resource.virtual_host,
+    {ok, AmqSup} = rabbit_amqqueue_sup_sup:find_for_vhost(VHost, node(QPid)),
+    Sups = supervisor:which_children(AmqSup),
+    get_queue_sup_pid(Sups, QPid).
+
+get_queue_sup_pid([{_, SupPid, _, _} | Rest], QueuePid) ->
+    WorkerPids = [Pid || {_, Pid, _, _} <- supervisor:which_children(SupPid)],
+    case lists:member(QueuePid, WorkerPids) of
+        true  -> SupPid;
+        false -> get_queue_sup_pid(Rest, QueuePid)
+    end;
+get_queue_sup_pid([], _QueuePid) ->
+    undefined.
 
 variable_queue_dynamic_duration_change(Config) ->
     passed = rabbit_ct_broker_helpers:rpc(Config, 0,
@@ -1253,7 +1280,7 @@ make_publish_delivered(IsPersistent, PayloadFun, PropFun, N) ->
      PropFun(N, #message_properties{size = 10})}.
 
 queue_name(Config, Name) ->
-    Name1 = rabbit_ct_helpers:config_to_testcase_name(Config, Name),
+    Name1 = iolist_to_binary(rabbit_ct_helpers:config_to_testcase_name(Config, Name)),
     queue_name(Name1).
 
 queue_name(Name) ->
@@ -1275,14 +1302,14 @@ init_test_queue(QName) ->
     Res.
 
 restart_test_queue(Qi, QName) ->
-    _ = rabbit_queue_index:terminate([], Qi),
-    ok = rabbit_variable_queue:stop(),
-    {ok, _} = rabbit_variable_queue:start([QName]),
+    _ = rabbit_queue_index:terminate(?VHOST, [], Qi),
+    ok = rabbit_variable_queue:stop(?VHOST),
+    {ok, _} = rabbit_variable_queue:start(?VHOST, [QName]),
     init_test_queue(QName).
 
 empty_test_queue(QName) ->
-    ok = rabbit_variable_queue:stop(),
-    {ok, _} = rabbit_variable_queue:start([]),
+    ok = rabbit_variable_queue:stop(?VHOST),
+    {ok, _} = rabbit_variable_queue:start(?VHOST, []),
     {0, 0, Qi} = init_test_queue(QName),
     _ = rabbit_queue_index:delete_and_terminate(Qi),
     ok.
@@ -1337,7 +1364,7 @@ nop(_) -> ok.
 nop(_, _) -> ok.
 
 msg_store_client_init(MsgStore, Ref) ->
-    rabbit_msg_store_vhost_sup:client_init(MsgStore, Ref, undefined, undefined, <<"/">>).
+    rabbit_vhost_msg_store:client_init(?VHOST, MsgStore, Ref,  undefined, undefined).
 
 variable_queue_init(Q, Recover) ->
     rabbit_variable_queue:init(
@@ -1391,8 +1418,8 @@ with_fresh_variable_queue(Fun, Mode) ->
                                  shutdown, Fun(VQ1, QName)),
                            Me ! Ref
                        catch
-                           Type:Error ->
-                               Me ! {Ref, Type, Error, erlang:get_stacktrace()}
+                           Type:Error:Stacktrace ->
+                               Me ! {Ref, Type, Error, Stacktrace}
                        end
                end),
     receive
@@ -1476,8 +1503,7 @@ variable_queue_fetch(Count, IsPersistent, IsDelivered, Len, VQ) ->
                 end, {VQ, []}, lists:seq(1, Count)).
 
 test_amqqueue(QName, Durable) ->
-    (rabbit_amqqueue:pseudo_queue(QName, self()))
-        #amqqueue { durable = Durable }.
+    rabbit_amqqueue:pseudo_queue(QName, self(), Durable).
 
 assert_prop(List, Prop, Value) ->
     case proplists:get_value(Prop, List)of
@@ -1587,94 +1613,3 @@ check_variable_queue_status(VQ0, Props) ->
     S = variable_queue_status(VQ1),
     assert_props(S, Props),
     VQ1.
-
-%% ---------------------------------------------------------------------------
-%% rabbitmqctl helpers.
-%% ---------------------------------------------------------------------------
-
-control_action(Command, Args) ->
-    control_action(Command, node(), Args, default_options()).
-
-control_action(Command, Args, NewOpts) ->
-    control_action(Command, node(), Args,
-                   expand_options(default_options(), NewOpts)).
-
-control_action(Command, Node, Args, Opts) ->
-    case catch rabbit_control_main:action(
-                 Command, Node, Args, Opts,
-                 fun (Format, Args1) ->
-                         io:format(Format ++ " ...~n", Args1)
-                 end) of
-        ok ->
-            io:format("done.~n"),
-            ok;
-        {ok, Result} ->
-            rabbit_control_misc:print_cmd_result(Command, Result),
-            ok;
-        Other ->
-            io:format("failed: ~p~n", [Other]),
-            Other
-    end.
-
-control_action_t(Command, Args, Timeout) when is_number(Timeout) ->
-    control_action_t(Command, node(), Args, default_options(), Timeout).
-
-control_action_t(Command, Args, NewOpts, Timeout) when is_number(Timeout) ->
-    control_action_t(Command, node(), Args,
-                     expand_options(default_options(), NewOpts),
-                     Timeout).
-
-control_action_t(Command, Node, Args, Opts, Timeout) when is_number(Timeout) ->
-    case catch rabbit_control_main:action(
-                 Command, Node, Args, Opts,
-                 fun (Format, Args1) ->
-                         io:format(Format ++ " ...~n", Args1)
-                 end, Timeout) of
-        ok ->
-            io:format("done.~n"),
-            ok;
-        {ok, Result} ->
-            rabbit_control_misc:print_cmd_result(Command, Result),
-            ok;
-        Other ->
-            io:format("failed: ~p~n", [Other]),
-            Other
-    end.
-
-control_action_opts(Raw) ->
-    NodeStr = atom_to_list(node()),
-    case rabbit_control_main:parse_arguments(Raw, NodeStr) of
-        {ok, {Cmd, Opts, Args}} ->
-            case control_action(Cmd, node(), Args, Opts) of
-                ok    -> ok;
-                Error -> Error
-            end;
-        Error ->
-            Error
-    end.
-
-info_action(Command, Args, CheckVHost) ->
-    ok = control_action(Command, []),
-    if CheckVHost -> ok = control_action(Command, [], ["-p", "/"]);
-       true       -> ok
-    end,
-    ok = control_action(Command, lists:map(fun atom_to_list/1, Args)),
-    {bad_argument, dummy} = control_action(Command, ["dummy"]),
-    ok.
-
-info_action_t(Command, Args, CheckVHost, Timeout) when is_number(Timeout) ->
-    if CheckVHost -> ok = control_action_t(Command, [], ["-p", "/"], Timeout);
-       true       -> ok
-    end,
-    ok = control_action_t(Command, lists:map(fun atom_to_list/1, Args), Timeout),
-    ok.
-
-default_options() -> [{"-p", "/"}, {"-q", "false"}].
-
-expand_options(As, Bs) ->
-    lists:foldl(fun({K, _}=A, R) ->
-                        case proplists:is_defined(K, R) of
-                            true -> R;
-                            false -> [A | R]
-                        end
-                end, Bs, As).

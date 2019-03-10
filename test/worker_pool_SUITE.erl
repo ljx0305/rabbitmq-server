@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(worker_pool_SUITE).
@@ -142,7 +142,7 @@ cancel_timeout(_) ->
         reuse),
 
     timer:sleep(1000),
-    receive {hello, Worker, Test} -> exit(timeout_is_not_canceleld)
+    receive {hello, Worker, Test} -> exit(timeout_is_not_cancelled)
     after 0 -> ok
     end.
 
@@ -179,7 +179,7 @@ cancel_timeout_by_setting(_) ->
         reuse),
 
     timer:sleep(1000),
-    receive {hello, Worker, Test} -> exit(timeout_is_not_canceleld)
+    receive {hello, Worker, Test} -> exit(timeout_is_not_cancelled)
     after 0 -> ok
     end,
 

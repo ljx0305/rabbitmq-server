@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_mnesia_rename).
@@ -44,9 +44,6 @@
 %%----------------------------------------------------------------------------
 
 -spec rename(node(), [{node(), node()}]) -> 'ok'.
--spec maybe_finish([node()]) -> 'ok'.
-
-%%----------------------------------------------------------------------------
 
 rename(Node, NodeMapList) ->
     try
@@ -138,6 +135,8 @@ restore_backup(Backup) ->
     start_mnesia(),
     stop_mnesia(),
     rabbit_mnesia:force_load_next_boot().
+
+-spec maybe_finish([node()]) -> 'ok'.
 
 maybe_finish(AllNodes) ->
     case rabbit_file:read_term_file(rename_config_name()) of
@@ -274,8 +273,12 @@ become(BecomeNode) ->
         pong -> exit({node_running, BecomeNode});
         pang -> ok = net_kernel:stop(),
                 io:format("  * Impersonating node: ~s...", [BecomeNode]),
-                {ok, _} = rabbit_cli:start_distribution(BecomeNode),
+                {ok, _} = start_distribution(BecomeNode),
                 io:format(" done~n", []),
                 Dir = mnesia:system_info(directory),
                 io:format("  * Mnesia directory  : ~s~n", [Dir])
     end.
+
+start_distribution(Name) ->
+    rabbit_nodes:ensure_epmd(),
+    net_kernel:start([Name, rabbit_nodes:name_type()]).

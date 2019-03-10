@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_parameter_validation).
@@ -22,13 +22,13 @@ number(_Name, Term) when is_number(Term) ->
     ok;
 
 number(Name, Term) ->
-    {error, "~s should be number, actually was ~p", [Name, Term]}.
+    {error, "~s should be a number, actually was ~p", [Name, Term]}.
 
 integer(_Name, Term) when is_integer(Term) ->
     ok;
 
 integer(Name, Term) ->
-    {error, "~s should be number, actually was ~p", [Name, Term]}.
+    {error, "~s should be a number, actually was ~p", [Name, Term]}.
 
 binary(_Name, Term) when is_binary(Term) ->
     ok;
@@ -76,6 +76,10 @@ proplist(Name, Constraints, Term) when is_list(Term) ->
         _  -> [{error, "Unrecognised terms ~p in ~s", [Remainder, Name]}
                | Results]
     end;
+
+proplist(Name, Constraints, Term0) when is_map(Term0) ->
+    Term = maps:to_list(Term0),
+    proplist(Name, Constraints, Term);
 
 proplist(Name, _Constraints, Term) ->
     {error, "~s not a list ~p", [Name, Term]}.

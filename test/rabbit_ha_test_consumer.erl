@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 -module(rabbit_ha_test_consumer).
 
@@ -64,7 +64,7 @@ run(TestPid, Channel, Queue, CancelOnFailover, LowestSeen, MsgsToConsume) ->
                         CancelOnFailover, MsgNum, MsgsToConsume - 1);
                 MsgNum >= LowestSeen ->
                     error_logger:info_msg(
-                      "consumer ~p on ~p ignoring redeliverd msg ~p~n",
+                      "consumer ~p on ~p ignoring redelivered msg ~p~n",
                       [self(), Channel, MsgNum]),
                     true = Redelivered, %% ASSERTION
                     run(TestPid, Channel, Queue,

@@ -12,10 +12,11 @@ define PROJECT_ENV
 	    {tcp_listeners, [5672]},
 	    {num_tcp_acceptors, 10},
 	    {ssl_listeners, []},
-	    {num_ssl_acceptors, 1},
+	    {num_ssl_acceptors, 10},
 	    {ssl_options, []},
 	    {vm_memory_high_watermark, 0.4},
 	    {vm_memory_high_watermark_paging_ratio, 0.5},
+	    {vm_memory_calculation_strategy, rss},
 	    {memory_monitor_interval, 2500},
 	    {disk_free_limit, 50000000}, %% 50MB
 	    {msg_store_index_module, rabbit_msg_store_ets_index},
@@ -23,7 +24,9 @@ define PROJECT_ENV
 	    %% 0 ("no limit") would make a better default, but that
 	    %% breaks the QPid Java client
 	    {frame_max, 131072},
-	    {channel_max, 0},
+	    %% see rabbitmq-server#1593
+	    {channel_max, 2047},
+	    {connection_max, infinity},
 	    {heartbeat, 60},
 	    {msg_store_file_size_limit, 16777216},
 	    {fhc_write_buffering, true},
@@ -46,7 +49,6 @@ define PROJECT_ENV
 	    {auth_backends, [rabbit_auth_backend_internal]},
 	    {delegate_count, 16},
 	    {trace_vhosts, []},
-	    {log_levels, [{connection, info}]},
 	    {ssl_cert_login_from, distinguished_name},
 	    {ssl_handshake_timeout, 5000},
 	    {ssl_allow_poodle_attack, false},
@@ -61,7 +63,7 @@ define PROJECT_ENV
 	                         ]},
 	    {halt_on_upgrade_failure, true},
 	    {hipe_compile, false},
-	    %% see bug 24513 for how this list was created
+	    %% see bug 24513 [in legacy Bugzilla] for how this list was created
 	    {hipe_modules,
 	     [rabbit_reader, rabbit_channel, gen_server2, rabbit_exchange,
 	      rabbit_command_assembler, rabbit_framing_amqp_0_9_1, rabbit_basic,
@@ -94,12 +96,16 @@ define PROJECT_ENV
 	    %% see rabbitmq-server#143,
 	    %% rabbitmq-server#949, rabbitmq-server#1098
 	    {credit_flow_default_credit, {400, 200}},
+	    {quorum_commands_soft_limit, 256},
+	    {quorum_cluster_size, 5},
 	    %% see rabbitmq-server#248
 	    %% and rabbitmq-server#667
 	    {channel_operation_timeout, 15000},
 
 	    %% see rabbitmq-server#486
-	    {peer_discovery_backend, rabbit_peer_discovery_classic_config},
+	    {autocluster,
+              [{peer_discovery_backend, rabbit_peer_discovery_classic_config}]
+            },
 	    %% used by rabbit_peer_discovery_classic_config
 	    {cluster_nodes, {[], disc}},
 
@@ -109,38 +115,43 @@ define PROJECT_ENV
 	                            {passphrase, undefined}
 	                           ]},
 
-	    %% rabbitmq-server-973
+	    %% rabbitmq-server#973
 	    {queue_explicit_gc_run_operation_threshold, 1000},
 	    {lazy_queue_explicit_gc_run_operation_threshold, 1000},
 	    {background_gc_enabled, false},
 	    {background_gc_target_interval, 60000},
-	    %% rabbitmq-server-589
-	    {proxy_protocol, false}
+	    %% rabbitmq-server#589
+	    {proxy_protocol, false},
+	    {disk_monitor_failure_retries, 10},
+	    {disk_monitor_failure_retry_interval, 120000},
+	    %% either "stop_node" or "continue".
+	    %% by default we choose to not terminate the entire node if one
+	    %% vhost had to shut down, see server#1158 and server#1280
+	    {vhost_restart_strategy, continue},
+	    %% {global, prefetch count}
+	    {default_consumer_prefetch, {false, 0}},
+	    {channel_queue_cleanup_interval, 60000},
+	    %% Default max message size is 128 MB
+	    {max_message_size, 134217728}
 	  ]
 endef
 
-LOCAL_DEPS = sasl mnesia os_mon
-BUILD_DEPS = rabbitmq_cli
-DEPS = ranch lager rabbit_common
+LOCAL_DEPS = sasl mnesia os_mon inets compiler public_key crypto ssl syntax_tools
+BUILD_DEPS = rabbitmq_cli syslog
+DEPS = ranch lager rabbit_common ra sysmon_handler
 TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers amqp_client meck proper
 
-dep_rabbitmq_cli = git_rmq rabbitmq-cli $(current_rmq_ref) $(base_rmq_ref) rabbitmq-cli-integration
+dep_syslog = git https://github.com/schlagert/syslog 3.4.5
 
 define usage_xml_to_erl
 $(subst __,_,$(patsubst $(DOCS_DIR)/rabbitmq%.1.xml, src/rabbit_%_usage.erl, $(subst -,_,$(1))))
 endef
 
 DOCS_DIR     = docs
-MANPAGES     = $(patsubst %.xml, %, $(wildcard $(DOCS_DIR)/*.[0-9].xml))
-WEB_MANPAGES = $(patsubst %.xml, %.man.xml, $(wildcard $(DOCS_DIR)/*.[0-9].xml) $(DOCS_DIR)/rabbitmq-service.xml $(DOCS_DIR)/rabbitmq-echopid.xml)
-USAGES_XML   = $(DOCS_DIR)/rabbitmqctl.1.xml $(DOCS_DIR)/rabbitmq-plugins.1.xml
-USAGES_ERL   = $(foreach XML, $(USAGES_XML), $(call usage_xml_to_erl, $(XML)))
+MANPAGES     = $(wildcard $(DOCS_DIR)/*.[0-9])
+WEB_MANPAGES = $(patsubst %,%.html,$(MANPAGES))
 
-EXTRA_SOURCES += $(USAGES_ERL)
-
-.DEFAULT_GOAL = all
-$(PROJECT).d:: $(EXTRA_SOURCES)
-
+DEP_EARLY_PLUGINS = rabbit_common/mk/rabbitmq-early-test.mk
 DEP_PLUGINS = rabbit_common/mk/rabbitmq-build.mk \
 	      rabbit_common/mk/rabbitmq-dist.mk \
 	      rabbit_common/mk/rabbitmq-run.mk \
@@ -156,16 +167,50 @@ ERLANG_MK_COMMIT = rabbitmq-tmp
 include rabbitmq-components.mk
 include erlang.mk
 
+ifeq ($(strip $(BATS)),)
+BATS := $(ERLANG_MK_TMP)/bats/bin/bats
+endif
+
+BATS_GIT ?= https://github.com/sstephenson/bats
+BATS_COMMIT ?= v0.4.0
+
+$(BATS):
+	$(verbose) mkdir -p $(ERLANG_MK_TMP)
+	$(gen_verbose) git clone --depth 1 --branch=$(BATS_COMMIT) $(BATS_GIT) $(ERLANG_MK_TMP)/bats
+
+.PHONY: bats
+
+bats: $(BATS)
+	$(verbose) $(BATS) $(TEST_DIR)
+
+tests:: bats
+
 SLOW_CT_SUITES := backing_queue \
 		  cluster_rename \
 		  clustering_management \
+		  config_schema \
 		  dynamic_ha \
 		  eager_sync \
+		  feature_flags \
 		  health_check \
+		  lazy_queue \
+		  metrics \
+		  msg_store \
 		  partitions \
+		  per_user_connection_tracking \
+		  per_vhost_connection_limit \
+		  per_vhost_msg_store \
+		  per_vhost_queue_limit \
+		  policy \
 		  priority_queue \
 		  queue_master_location \
-		  simple_ha
+		  quorum_queue \
+		  rabbit_core_metrics_gc \
+		  rabbit_fifo_prop \
+		  simple_ha \
+		  sync_detection \
+		  unit_inbroker_parallel \
+		  vhost
 FAST_CT_SUITES := $(filter-out $(sort $(SLOW_CT_SUITES)),$(CT_SUITES))
 
 ct-fast: CT_SUITES = $(FAST_CT_SUITES)
@@ -187,6 +232,10 @@ ifdef CREDIT_FLOW_TRACING
 RMQ_ERLC_OPTS += -DCREDIT_FLOW_TRACING=true
 endif
 
+ifdef DEBUG_FF
+RMQ_ERLC_OPTS += -DDEBUG_QUORUM_QUEUE_FF=true
+endif
+
 ifndef USE_PROPER_QC
 # PropEr needs to be installed for property checking
 # http://proper.softlab.ntua.gr/
@@ -203,10 +252,7 @@ copy-escripts:
 		PREFIX="$(abspath $(CLI_ESCRIPTS_DIR))" \
 		DESTDIR=
 
-clean:: clean-extra-sources clean-escripts
-
-clean-extra-sources:
-	$(gen_verbose) rm -f $(EXTRA_SOURCES)
+clean:: clean-escripts
 
 clean-escripts:
 	$(gen_verbose) rm -rf "$(CLI_ESCRIPTS_DIR)"
@@ -214,43 +260,6 @@ clean-escripts:
 # --------------------------------------------------------------------
 # Documentation.
 # --------------------------------------------------------------------
-
-# xmlto can not read from standard input, so we mess with a tmp file.
-%: %.xml $(DOCS_DIR)/examples-to-end.xsl
-	$(gen_verbose) xmlto --version | \
-	    grep -E '^xmlto version 0\.0\.([0-9]|1[1-8])$$' >/dev/null || \
-	    opt='--stringparam man.indent.verbatims=0' ; \
-	xsltproc --novalid $(DOCS_DIR)/examples-to-end.xsl $< > $<.tmp && \
-	xmlto -vv -o $(DOCS_DIR) $$opt man $< 2>&1 | (grep -v '^Note: Writing' || :) && \
-	test -f $@ && \
-	rm $<.tmp
-
-# Use tmp files rather than a pipeline so that we get meaningful errors
-# Do not fold the cp into previous line, it's there to stop the file being
-# generated but empty if we fail
-define usage_dep
-$(call usage_xml_to_erl, $(1)):: $(1) $(DOCS_DIR)/usage.xsl
-	$$(gen_verbose) xsltproc --novalid --stringparam modulename "`basename $$@ .erl`" \
-	    $(DOCS_DIR)/usage.xsl $$< > $$@.tmp && \
-	sed -e 's/"/\\"/g' -e 's/%QUOTE%/"/g' $$@.tmp > $$@.tmp2 && \
-	fold -s $$@.tmp2 > $$@.tmp3 && \
-	mv $$@.tmp3 $$@ && \
-	rm $$@.tmp $$@.tmp2
-endef
-
-$(foreach XML,$(USAGES_XML),$(eval $(call usage_dep, $(XML))))
-
-# We rename the file before xmlto sees it since xmlto will use the name of
-# the file to make internal links.
-%.man.xml: %.xml $(DOCS_DIR)/html-to-website-xml.xsl
-	$(gen_verbose) cp $< `basename $< .xml`.xml && \
-	    xmlto xhtml-nochunks `basename $< .xml`.xml ; \
-	rm `basename $< .xml`.xml && \
-	cat `basename $< .xml`.html | \
-	    xsltproc --novalid $(DOCS_DIR)/remove-namespaces.xsl - | \
-	      xsltproc --novalid --stringparam original `basename $<` $(DOCS_DIR)/html-to-website-xml.xsl - | \
-	      xmllint --format - > $@ && \
-	rm `basename $< .xml`.html
 
 .PHONY: manpages web-manpages distclean-manpages
 
@@ -262,9 +271,33 @@ manpages: $(MANPAGES)
 web-manpages: $(WEB_MANPAGES)
 	@:
 
+# We use mandoc(1) to convert manpages to HTML plus an awk script which
+# does:
+#     1. remove tables at the top and the bottom (they recall the
+#        manpage name, section and date)
+#     2. "downgrade" headers by one level (eg. h1 -> h2)
+#     3. annotate .Dl lines with more CSS classes
+%.html: %
+	$(gen_verbose) mandoc -T html -O 'fragment,man=%N.%S.html' "$<" | \
+	  awk '\
+	  /^<table class="head">$$/ { remove_table=1; next; } \
+	  /^<table class="foot">$$/ { remove_table=1; next; } \
+	  /^<\/table>$$/ { if (remove_table) { remove_table=0; next; } } \
+	  { if (!remove_table) { \
+	    line=$$0; \
+	    gsub(/<h2/, "<h3", line); \
+	    gsub(/<\/h2>/, "</h3>", line); \
+	    gsub(/<h1/, "<h2", line); \
+	    gsub(/<\/h1>/, "</h2>", line); \
+	    gsub(/class="D1"/, "class=\"D1 lang-bash\"", line); \
+	    gsub(/class="Bd Bd-indent"/, "class=\"Bd Bd-indent lang-bash\"", line); \
+	    print line; \
+	  } } \
+	  ' > "$@"
+
 distclean:: distclean-manpages
 
 distclean-manpages::
-	$(gen_verbose) rm -f $(MANPAGES) $(WEB_MANPAGES)
+	$(gen_verbose) rm -f $(WEB_MANPAGES)
 
 app-build: copy-escripts

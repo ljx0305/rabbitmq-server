@@ -11,12 +11,13 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2011-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2011-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(unit_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("rabbit_common/include/rabbit_framing.hrl").
 
@@ -31,7 +32,7 @@ all() ->
 groups() ->
     [
       {parallel_tests, [parallel], [
-          arguments_parser,
+          auth_backend_internal_expand_topic_permission,
           {basic_header_handling, [parallel], [
               write_table_with_invalid_existing_type,
               invalid_existing_headers,
@@ -43,12 +44,11 @@ groups() ->
           content_transcoding,
           decrypt_config,
           listing_plugins_from_multiple_directories,
-          mutually_exclusive_flags_parsing,
           rabbitmqctl_encode,
-          pg_local,
           pmerge,
           plmerge,
           priority_queue,
+          rabbit_direct_extract_extra_auth_props,
           {resource_monitor, [parallel], [
               parse_information_unit
             ]},
@@ -57,17 +57,15 @@ groups() ->
               check_shutdown_ignored
             ]},
           table_codec,
-          {truncate, [parallel], [
-              short_examples_exactly,
-              term_limit,
-              large_examples_for_size
-            ]},
           unfold,
           {vm_memory_monitor, [parallel], [
               parse_line_linux
             ]}
         ]},
       {sequential_tests, [], [
+          pg_local,
+          pg_local_with_unexpected_deaths1,
+          pg_local_with_unexpected_deaths2,
           decrypt_start_app,
           decrypt_start_app_file,
           decrypt_start_app_undefined,
@@ -82,6 +80,7 @@ init_per_testcase(TC, Config) when TC =:= decrypt_start_app;
                                    TC =:= decrypt_start_app_file;
                                    TC =:= decrypt_start_app_undefined ->
     application:load(rabbit),
+    application:set_env(rabbit, feature_flags_file, ""),
     Config;
 init_per_testcase(_Testcase, Config) ->
     Config.
@@ -95,104 +94,6 @@ end_per_testcase(decrypt_config, _Config) ->
     application:unload(rabbit);
 end_per_testcase(_TC, _Config) ->
     ok.
-
-%% -------------------------------------------------------------------
-%% Argument parsing.
-%% -------------------------------------------------------------------
-
-arguments_parser(_Config) ->
-    GlobalOpts1 = [{"-f1", flag}, {"-o1", {option, "foo"}}],
-    Commands1 = [command1, {command2, [{"-f2", flag}, {"-o2", {option, "bar"}}]}],
-
-    GetOptions =
-        fun (Args) ->
-                rabbit_cli:parse_arguments(Commands1, GlobalOpts1, "-n", Args)
-        end,
-
-    check_parse_arguments(no_command, GetOptions, []),
-    check_parse_arguments(no_command, GetOptions, ["foo", "bar"]),
-    check_parse_arguments(
-      {ok, {command1, [{"-f1", false}, {"-o1", "foo"}], []}},
-      GetOptions, ["command1"]),
-    check_parse_arguments(
-      {ok, {command1, [{"-f1", false}, {"-o1", "blah"}], []}},
-      GetOptions, ["command1", "-o1", "blah"]),
-    check_parse_arguments(
-      {ok, {command1, [{"-f1", true}, {"-o1", "foo"}], []}},
-      GetOptions, ["command1", "-f1"]),
-    check_parse_arguments(
-      {ok, {command1, [{"-f1", false}, {"-o1", "blah"}], []}},
-      GetOptions, ["-o1", "blah", "command1"]),
-    check_parse_arguments(
-      {ok, {command1, [{"-f1", false}, {"-o1", "blah"}], ["quux"]}},
-      GetOptions, ["-o1", "blah", "command1", "quux"]),
-    check_parse_arguments(
-      {ok, {command1, [{"-f1", true}, {"-o1", "blah"}], ["quux", "baz"]}},
-      GetOptions, ["command1", "quux", "-f1", "-o1", "blah", "baz"]),
-    %% For duplicate flags, the last one counts
-    check_parse_arguments(
-      {ok, {command1, [{"-f1", false}, {"-o1", "second"}], []}},
-      GetOptions, ["-o1", "first", "command1", "-o1", "second"]),
-    %% If the flag "eats" the command, the command won't be recognised
-    check_parse_arguments(no_command, GetOptions,
-                          ["-o1", "command1", "quux"]),
-    %% If a flag eats another flag, the eaten flag won't be recognised
-    check_parse_arguments(
-      {ok, {command1, [{"-f1", false}, {"-o1", "-f1"}], []}},
-      GetOptions, ["command1", "-o1", "-f1"]),
-
-    %% Now for some command-specific flags...
-    check_parse_arguments(
-      {ok, {command2, [{"-f1", false}, {"-f2", false},
-                       {"-o1", "foo"}, {"-o2", "bar"}], []}},
-      GetOptions, ["command2"]),
-
-    check_parse_arguments(
-      {ok, {command2, [{"-f1", false}, {"-f2", true},
-                       {"-o1", "baz"}, {"-o2", "bar"}], ["quux", "foo"]}},
-      GetOptions, ["-f2", "command2", "quux", "-o1", "baz", "foo"]),
-
-    passed.
-
-check_parse_arguments(ExpRes, Fun, As) ->
-    SortRes =
-        fun (no_command)          -> no_command;
-            ({ok, {C, KVs, As1}}) -> {ok, {C, lists:sort(KVs), As1}}
-        end,
-
-    true = SortRes(ExpRes) =:= SortRes(Fun(As)).
-
-mutually_exclusive_flags_parsing(_Config) ->
-    Matcher = fun ({ok, Value}, {ok, Value}) -> true;
-                  ({error, Value}, {error, Pattern}) ->
-                      case re:run(Value, Pattern) of
-                          {match, _} -> true;
-                          _ -> false
-                      end;
-                  (_, _) -> false
-              end,
-    Spec = [{"--online", online}
-           ,{"--offline", offline}
-           ,{"--local", local}],
-    Default = all,
-    Cases =[{["--online"], {ok, online}}
-           ,{[], {ok, Default}}
-           ,{["--offline"], {ok, offline}}
-           ,{["--local"], {ok, local}}
-           ,{["--offline", "--local"], {error, "mutually exclusive"}}
-           ,{["--offline", "--online"], {error, "mutually exclusive"}}
-           ,{["--offline", "--local", "--online"], {error, "mutually exclusive"}}
-           ],
-    lists:foreach(fun({Opts, Expected}) ->
-                          ExpandedOpts = [ {Opt, true} || Opt <- Opts ],
-                          Got = rabbit_cli:mutually_exclusive_flags(ExpandedOpts, all, Spec),
-                          case Matcher(Got, Expected) of
-                              true ->
-                                  ok;
-                              false ->
-                                  exit({no_match, Got, Expected, {opts, Opts}})
-                          end
-                  end, Cases).
 
 %% -------------------------------------------------------------------
 %% basic_header_handling.
@@ -332,7 +233,7 @@ do_decrypt_start_app(Config, Passphrase) ->
     %%
     %% We expect a failure *after* the decrypting has been done.
     try
-        rabbit:start_apps([rabbit_shovel_test])
+        rabbit:start_apps([rabbit_shovel_test], #{rabbit => temporary})
     catch _:_ ->
         ok
     end,
@@ -359,10 +260,10 @@ decrypt_start_app_undefined(Config) ->
     %%
     %% We expect a failure during decryption because the passphrase is missing.
     try
-        rabbit:start_apps([rabbit_shovel_test])
+        rabbit:start_apps([rabbit_shovel_test], #{rabbit => temporary})
     catch
         exit:{bad_configuration, config_entry_decoder} -> ok;
-        _:_ -> exit(unexpected_exception)
+        _:Exception -> exit({unexpected_exception, Exception})
     end.
 
 decrypt_start_app_wrong_passphrase(Config) ->
@@ -379,37 +280,31 @@ decrypt_start_app_wrong_passphrase(Config) ->
     %%
     %% We expect a failure during decryption because the passphrase is wrong.
     try
-        rabbit:start_apps([rabbit_shovel_test])
+        rabbit:start_apps([rabbit_shovel_test], #{rabbit => temporary})
     catch
         exit:{decryption_error,_,_} -> ok;
-        _:_ -> exit(unexpected_exception)
+        _:Exception -> exit({unexpected_exception, Exception})
     end.
 
 rabbitmqctl_encode(_Config) ->
     % list ciphers and hashes
-    {ok, _} = rabbit_control_pbe:encode(true, false, undefined, undefined, undefined, undefined, undefined),
-    {ok, _} = rabbit_control_pbe:encode(false, true, undefined, undefined, undefined, undefined, undefined),
+    {ok, _} = rabbit_control_pbe:list_ciphers(),
+    {ok, _} = rabbit_control_pbe:list_hashes(),
     % incorrect ciphers, hashes and iteration number
-    {error, _} = rabbit_control_pbe:encode(false, false, undefined, funny_cipher, undefined, undefined, undefined),
-    {error, _} = rabbit_control_pbe:encode(false, false, undefined, undefined, funny_hash, undefined, undefined),
-    {error, _} = rabbit_control_pbe:encode(false, false, undefined, undefined, undefined, -1, undefined),
-    {error, _} = rabbit_control_pbe:encode(false, false, undefined, undefined, undefined, 0, undefined),
+    {error, _} = rabbit_control_pbe:encode(funny_cipher, undefined, undefined, undefined),
+    {error, _} = rabbit_control_pbe:encode(undefined, funny_hash, undefined, undefined),
+    {error, _} = rabbit_control_pbe:encode(undefined, undefined, -1, undefined),
+    {error, _} = rabbit_control_pbe:encode(undefined, undefined, 0, undefined),
     % incorrect number of arguments
     {error, _} = rabbit_control_pbe:encode(
-        false, false,
-        false, % encrypt
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         []
     ),
     {error, _} = rabbit_control_pbe:encode(
-        false, false,
-        false, % encrypt
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [undefined]
     ),
     {error, _} = rabbit_control_pbe:encode(
-        false, false,
-        false, % encrypt
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [undefined, undefined, undefined]
     ),
@@ -427,73 +322,133 @@ rabbitmqctl_encode(_Config) ->
 rabbitmqctl_encode_encrypt_decrypt(Secret) ->
     PassPhrase = "passphrase",
     {ok, Output} = rabbit_control_pbe:encode(
-        false, false,
-        false, % encrypt
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [Secret, PassPhrase]
     ),
     {encrypted, Encrypted} = rabbit_control_pbe:evaluate_input_as_term(lists:flatten(Output)),
 
-    {ok, Result} = rabbit_control_pbe:encode(
-        false, false,
-        true, % decrypt
+    {ok, Result} = rabbit_control_pbe:decode(
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [lists:flatten(io_lib:format("~p", [Encrypted])), PassPhrase]
     ),
     Secret = lists:flatten(Result),
     % decrypt with {encrypted, ...} form as input
-    {ok, Result} = rabbit_control_pbe:encode(
-        false, false,
-        true, % decrypt
+    {ok, Result} = rabbit_control_pbe:decode(
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [lists:flatten(io_lib:format("~p", [{encrypted, Encrypted}])), PassPhrase]
     ),
 
     % wrong passphrase
-    {error, _} = rabbit_control_pbe:encode(
-        false, false,
-        true, % decrypt
+    {error, _} = rabbit_control_pbe:decode(
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [lists:flatten(io_lib:format("~p", [Encrypted])), PassPhrase ++ " "]
     ),
-    {error, _} = rabbit_control_pbe:encode(
-        false, false,
-        true, % decrypt
+    {error, _} = rabbit_control_pbe:decode(
         rabbit_pbe:default_cipher(), rabbit_pbe:default_hash(), rabbit_pbe:default_iterations(),
         [lists:flatten(io_lib:format("~p", [{encrypted, Encrypted}])), PassPhrase ++ " "]
     )
     .
 
-
+rabbit_direct_extract_extra_auth_props(_Config) ->
+    {ok, CSC} = code_server_cache:start_link(),
+    % no protocol to extract
+    [] = rabbit_direct:extract_extra_auth_props(
+        {<<"guest">>, <<"guest">>}, <<"/">>, 1,
+        [{name,<<"127.0.0.1:52366 -> 127.0.0.1:1883">>}]),
+    % protocol to extract, but no module to call
+    [] = rabbit_direct:extract_extra_auth_props(
+        {<<"guest">>, <<"guest">>}, <<"/">>, 1,
+        [{protocol, {'PROTOCOL_WITHOUT_MODULE', "1.0"}}]),
+    % see rabbit_dummy_protocol_connection_info module
+    % protocol to extract, module that returns a client ID
+    [{client_id, <<"DummyClientId">>}] = rabbit_direct:extract_extra_auth_props(
+        {<<"guest">>, <<"guest">>}, <<"/">>, 1,
+        [{protocol, {'DUMMY_PROTOCOL', "1.0"}}]),
+    % protocol to extract, but error thrown in module
+    [] = rabbit_direct:extract_extra_auth_props(
+        {<<"guest">>, <<"guest">>}, <<"/">>, -1,
+        [{protocol, {'DUMMY_PROTOCOL', "1.0"}}]),
+    gen_server:stop(CSC),
+    ok.
 
 %% -------------------------------------------------------------------
 %% pg_local.
 %% -------------------------------------------------------------------
 
 pg_local(_Config) ->
-    [P, Q] = [spawn(fun () -> receive X -> X end end) || _ <- [x, x]],
+    [P, Q] = [spawn(fun () -> receive X -> X end end) || _ <- lists:seq(0, 1)],
     check_pg_local(ok, [], []),
+    %% P joins group a, then b, then a again
     check_pg_local(pg_local:join(a, P), [P], []),
     check_pg_local(pg_local:join(b, P), [P], [P]),
     check_pg_local(pg_local:join(a, P), [P, P], [P]),
+    %% Q joins group a, then b, then b again
     check_pg_local(pg_local:join(a, Q), [P, P, Q], [P]),
     check_pg_local(pg_local:join(b, Q), [P, P, Q], [P, Q]),
     check_pg_local(pg_local:join(b, Q), [P, P, Q], [P, Q, Q]),
+    %% P leaves groups a and a
     check_pg_local(pg_local:leave(a, P), [P, Q], [P, Q, Q]),
     check_pg_local(pg_local:leave(b, P), [P, Q], [Q, Q]),
+    %% leave/2 is idempotent
     check_pg_local(pg_local:leave(a, P), [Q], [Q, Q]),
     check_pg_local(pg_local:leave(a, P), [Q], [Q, Q]),
+    %% clean up all processes
     [begin X ! done,
            Ref = erlang:monitor(process, X),
            receive {'DOWN', Ref, process, X, _Info} -> ok end
      end  || X <- [P, Q]],
+    %% ensure the groups are empty
     check_pg_local(ok, [], []),
+    passed.
+
+pg_local_with_unexpected_deaths1(_Config) ->
+    [A, B] = [spawn(fun () -> receive X -> X end end) || _ <- lists:seq(0, 1)],
+    check_pg_local(ok, [], []),
+    %% A joins groups a and b
+    check_pg_local(pg_local:join(a, A), [A], []),
+    check_pg_local(pg_local:join(b, A), [A], [A]),
+    %% B joins group b
+    check_pg_local(pg_local:join(b, B), [A], [A, B]),
+
+    [begin erlang:exit(X, sleep_now_in_a_fire),
+           Ref = erlang:monitor(process, X),
+           receive {'DOWN', Ref, process, X, _Info} -> ok end
+     end  || X <- [A, B]],
+    %% ensure the groups are empty
+    check_pg_local(ok, [], []),
+    ?assertNot(erlang:is_process_alive(A)),
+    ?assertNot(erlang:is_process_alive(B)),
+
+    passed.
+
+pg_local_with_unexpected_deaths2(_Config) ->
+    [A, B] = [spawn(fun () -> receive X -> X end end) || _ <- lists:seq(0, 1)],
+    check_pg_local(ok, [], []),
+    %% A joins groups a and b
+    check_pg_local(pg_local:join(a, A), [A], []),
+    check_pg_local(pg_local:join(b, A), [A], [A]),
+    %% B joins group b
+    check_pg_local(pg_local:join(b, B), [A], [A, B]),
+
+    %% something else yanks a record (or all of them) from the pg_local
+    %% bookkeeping table
+    ok = pg_local:clear(),
+
+    [begin erlang:exit(X, sleep_now_in_a_fire),
+           Ref = erlang:monitor(process, X),
+           receive {'DOWN', Ref, process, X, _Info} -> ok end
+     end  || X <- [A, B]],
+    %% ensure the groups are empty
+    check_pg_local(ok, [], []),
+    ?assertNot(erlang:is_process_alive(A)),
+    ?assertNot(erlang:is_process_alive(B)),
+
     passed.
 
 check_pg_local(ok, APids, BPids) ->
     ok = pg_local:sync(),
-    [true, true] = [lists:sort(Pids) == lists:sort(pg_local:get_members(Key)) ||
-                       {Key, Pids} <- [{a, APids}, {b, BPids}]].
+    ?assertEqual([true, true], [lists:sort(Pids) == lists:sort(pg_local:get_members(Key)) ||
+                                   {Key, Pids} <- [{a, APids}, {b, BPids}]]).
 
 %% -------------------------------------------------------------------
 %% priority_queue.
@@ -739,71 +694,6 @@ check_shutdown(SigStop, Iterations, ChildCount, SupTimeout) ->
     Res.
 
 %% ---------------------------------------------------------------------------
-%% truncate.
-%% ---------------------------------------------------------------------------
-
-short_examples_exactly(_Config) ->
-    F = fun (Term, Exp) ->
-                Exp = truncate:term(Term, {1, {10, 10, 5, 5}}),
-                Term = truncate:term(Term, {100000, {10, 10, 5, 5}})
-        end,
-    FSmall = fun (Term, Exp) ->
-                     Exp = truncate:term(Term, {1, {2, 2, 2, 2}}),
-                     Term = truncate:term(Term, {100000, {2, 2, 2, 2}})
-             end,
-    F([], []),
-    F("h", "h"),
-    F("hello world", "hello w..."),
-    F([[h,e,l,l,o,' ',w,o,r,l,d]], [[h,e,l,l,o,'...']]),
-    F([a|b], [a|b]),
-    F(<<"hello">>, <<"hello">>),
-    F([<<"hello world">>], [<<"he...">>]),
-    F(<<1:1>>, <<1:1>>),
-    F(<<1:81>>, <<0:56, "...">>),
-    F({{{{a}}},{b},c,d,e,f,g,h,i,j,k}, {{{'...'}},{b},c,d,e,f,g,h,i,j,'...'}),
-    FSmall({a,30,40,40,40,40}, {a,30,'...'}),
-    FSmall([a,30,40,40,40,40], [a,30,'...']),
-    P = spawn(fun() -> receive die -> ok end end),
-    F([0, 0.0, <<1:1>>, F, P], [0, 0.0, <<1:1>>, F, P]),
-    P ! die,
-    R = make_ref(),
-    F([R], [R]),
-    ok.
-
-term_limit(_Config) ->
-    W = erlang:system_info(wordsize),
-    S = <<"abc">>,
-    1 = truncate:term_size(S, 4, W),
-    limit_exceeded = truncate:term_size(S, 3, W),
-    case 100 - truncate:term_size([S, S], 100, W) of
-        22 -> ok; %% 32 bit
-        38 -> ok  %% 64 bit
-    end,
-    case 100 - truncate:term_size([S, [S]], 100, W) of
-        30 -> ok; %% ditto
-        54 -> ok
-    end,
-    limit_exceeded = truncate:term_size([S, S], 6, W),
-    ok.
-
-large_examples_for_size(_Config) ->
-    %% Real world values
-    Shrink = fun(Term) -> truncate:term(Term, {1, {1000, 100, 50, 5}}) end,
-    TestSize = fun(Term) ->
-                       true = 5000000 < size(term_to_binary(Term)),
-                       true = 500000 > size(term_to_binary(Shrink(Term)))
-               end,
-    TestSize(lists:seq(1, 5000000)),
-    TestSize(recursive_list(1000, 10)),
-    TestSize(recursive_list(5000, 20)),
-    TestSize(gb_sets:from_list([I || I <- lists:seq(1, 1000000)])),
-    TestSize(gb_trees:from_orddict([{I, I} || I <- lists:seq(1, 1000000)])),
-    ok.
-
-recursive_list(S, 0) -> lists:seq(1, S);
-recursive_list(S, N) -> [recursive_list(S div N, N-1) || _ <- lists:seq(1, S)].
-
-%% ---------------------------------------------------------------------------
 %% vm_memory_monitor.
 %% ---------------------------------------------------------------------------
 
@@ -1001,4 +891,38 @@ listing_plugins_from_multiple_directories(Config) ->
             ct:pal("Got ~p~nExpected: ~p", [Got, Expected]),
             exit({wrong_plugins_list, Got})
     end,
+    ok.
+
+auth_backend_internal_expand_topic_permission(_Config) ->
+    ExpandMap = #{<<"username">> => <<"guest">>, <<"vhost">> => <<"default">>},
+    %% simple case
+    <<"services/default/accounts/guest/notifications">> =
+        rabbit_auth_backend_internal:expand_topic_permission(
+            <<"services/{vhost}/accounts/{username}/notifications">>,
+            ExpandMap
+        ),
+    %% replace variable twice
+    <<"services/default/accounts/default/guest/notifications">> =
+        rabbit_auth_backend_internal:expand_topic_permission(
+            <<"services/{vhost}/accounts/{vhost}/{username}/notifications">>,
+            ExpandMap
+        ),
+    %% nothing to replace
+    <<"services/accounts/notifications">> =
+        rabbit_auth_backend_internal:expand_topic_permission(
+            <<"services/accounts/notifications">>,
+            ExpandMap
+        ),
+    %% the expand map isn't defined
+    <<"services/{vhost}/accounts/{username}/notifications">> =
+        rabbit_auth_backend_internal:expand_topic_permission(
+            <<"services/{vhost}/accounts/{username}/notifications">>,
+            undefined
+        ),
+    %% the expand map is empty
+    <<"services/{vhost}/accounts/{username}/notifications">> =
+        rabbit_auth_backend_internal:expand_topic_permission(
+            <<"services/{vhost}/accounts/{username}/notifications">>,
+            #{}
+        ),
     ok.

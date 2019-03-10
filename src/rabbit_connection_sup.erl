@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_connection_sup).
@@ -38,11 +38,8 @@
 
 -spec start_link(any(), rabbit_net:socket(), module(), any()) ->
           {'ok', pid(), pid()}.
--spec reader(pid()) -> pid().
 
-%%--------------------------------------------------------------------------
-
-start_link(Ref, Sock, _Transport, _Opts) ->
+start_link(Ref, _Sock, _Transport, _Opts) ->
     {ok, SupPid} = supervisor2:start_link(?MODULE, []),
     %% We need to get channels in the hierarchy here so they get shut
     %% down after the reader, so the reader gets a chance to terminate
@@ -62,9 +59,11 @@ start_link(Ref, Sock, _Transport, _Opts) ->
     {ok, ReaderPid} =
         supervisor2:start_child(
           SupPid,
-          {reader, {rabbit_reader, start_link, [HelperSup, Ref, Sock]},
+          {reader, {rabbit_reader, start_link, [HelperSup, Ref]},
            intrinsic, ?WORKER_WAIT, worker, [rabbit_reader]}),
     {ok, SupPid, ReaderPid}.
+
+-spec reader(pid()) -> pid().
 
 reader(Pid) ->
     hd(supervisor2:find_child(Pid, reader)).
@@ -72,4 +71,5 @@ reader(Pid) ->
 %%--------------------------------------------------------------------------
 
 init([]) ->
+    ?LG_PROCESS_TYPE(connection_sup),
     {ok, {{one_for_all, 0, 1}, []}}.

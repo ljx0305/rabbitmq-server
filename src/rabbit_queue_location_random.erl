@@ -11,13 +11,14 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_queue_location_random).
 -behaviour(rabbit_queue_master_locator).
 
--include("rabbit.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
+-include("amqqueue.hrl").
 
 -export([description/0, queue_master_location/1]).
 
@@ -37,8 +38,8 @@ description() ->
     [{description,
       <<"Locate queue master node from cluster in a random manner">>}].
 
-queue_master_location(#amqqueue{}) ->
-    Cluster    = rabbit_queue_master_location_misc:all_nodes(),
+queue_master_location(Q) when ?is_amqqueue(Q) ->
+    Cluster    = rabbit_queue_master_location_misc:all_nodes(Q),
     RandomPos  = erlang:phash2(erlang:monotonic_time(), length(Cluster)),
     MasterNode = lists:nth(RandomPos + 1, Cluster),
     {ok, MasterNode}.

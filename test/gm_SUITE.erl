@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2015 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(gm_SUITE).
@@ -28,7 +28,7 @@
         receive Body ->
                 true = Bool,
                 passed
-        after 1000 ->
+        after 5000 ->
                 throw(Error)
         end).
 

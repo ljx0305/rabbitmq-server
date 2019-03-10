@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_channel_sup).
@@ -47,11 +47,11 @@
          rabbit_types:protocol(), rabbit_types:user(), rabbit_types:vhost(),
          rabbit_framing:amqp_table(), pid()}.
 
--spec start_link(start_link_args()) -> {'ok', pid(), {pid(), any()}}.
-
 -define(FAIR_WAIT, 70000).
 
 %%----------------------------------------------------------------------------
+
+-spec start_link(start_link_args()) -> {'ok', pid(), {pid(), any()}}.
 
 start_link({tcp, Sock, Channel, FrameMax, ReaderPid, ConnName, Protocol, User,
             VHost, Capabilities, Collector}) ->
@@ -88,6 +88,7 @@ start_link({direct, Channel, ClientChannelPid, ConnPid, ConnName, Protocol,
 %%----------------------------------------------------------------------------
 
 init(Type) ->
+    ?LG_PROCESS_TYPE(channel_sup),
     {ok, {{one_for_all, 0, 1}, child_specs(Type)}}.
 
 child_specs({tcp, Sock, Channel, FrameMax, ReaderPid, Protocol, Identity}) ->

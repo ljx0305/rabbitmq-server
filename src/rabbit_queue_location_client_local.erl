@@ -11,13 +11,14 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_queue_location_client_local).
 -behaviour(rabbit_queue_master_locator).
 
--include("rabbit.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
+-include("amqqueue.hrl").
 
 -export([description/0, queue_master_location/1]).
 
@@ -37,4 +38,5 @@
 description() ->
     [{description, <<"Locate queue master node as the client local node">>}].
 
-queue_master_location(#amqqueue{}) ->   {ok, node()}.
+queue_master_location(Q) when ?is_amqqueue(Q) ->
+    {ok, node()}.

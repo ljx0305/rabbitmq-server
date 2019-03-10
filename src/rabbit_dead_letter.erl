@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_dead_letter).
@@ -23,12 +23,12 @@
 
 %%----------------------------------------------------------------------------
 
--type reason() :: 'expired' | 'rejected' | 'maxlen'.
+-type reason() :: 'expired' | 'rejected' | 'maxlen' | delivery_limit.
+
+%%----------------------------------------------------------------------------
 
 -spec publish(rabbit_types:message(), reason(), rabbit_types:exchange(),
               'undefined' | binary(), rabbit_amqqueue:name()) -> 'ok'.
-
-%%----------------------------------------------------------------------------
 
 publish(Msg, Reason, X, RK, QName) ->
     DLMsg = make_msg(Msg, Reason, X#exchange.name, RK, QName),
@@ -36,8 +36,7 @@ publish(Msg, Reason, X, RK, QName) ->
     {Queues, Cycles} = detect_cycles(Reason, DLMsg,
                                      rabbit_exchange:route(X, Delivery)),
     lists:foreach(fun log_cycle_once/1, Cycles),
-    rabbit_amqqueue:deliver(rabbit_amqqueue:lookup(Queues), Delivery),
-    ok.
+    rabbit_amqqueue:deliver(rabbit_amqqueue:lookup(Queues), Delivery).
 
 make_msg(Msg = #basic_message{content       = Content,
                               exchange_name = Exchange,
@@ -112,14 +111,25 @@ group_by_queue_and_reason(Tables) ->
           end, {sets:new(), []}, Tables),
     Grouped.
 
+update_x_death_header(Info, undefined) ->
+    update_x_death_header(Info, []);
 update_x_death_header(Info, Headers) ->
+    X = x_death_event_key(Info, <<"exchange">>),
     Q = x_death_event_key(Info, <<"queue">>),
     R = x_death_event_key(Info, <<"reason">>),
     case rabbit_basic:header(<<"x-death">>, Headers) of
         undefined ->
+            %% First x-death event gets its own top-level headers.
+            %% See rabbitmq/rabbitmq-server#1332.
+            Headers2 = rabbit_misc:set_table_value(Headers, <<"x-first-death-reason">>,
+                                                   longstr, R),
+            Headers3 = rabbit_misc:set_table_value(Headers2, <<"x-first-death-queue">>,
+                                                   longstr, Q),
+            Headers4 = rabbit_misc:set_table_value(Headers3, <<"x-first-death-exchange">>,
+                                                   longstr, X),
             rabbit_basic:prepend_table_header(
               <<"x-death">>,
-              [{<<"count">>, long, 1} | Info], Headers);
+              [{<<"count">>, long, 1} | Info], Headers4);
         {<<"x-death">>, array, Tables} ->
             %% group existing x-death headers in case we have some from
             %% before rabbitmq-server#78

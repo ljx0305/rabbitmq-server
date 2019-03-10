@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_client_sup).
@@ -28,18 +28,18 @@
 
 -spec start_link(rabbit_types:mfargs()) ->
           rabbit_types:ok_pid_or_error().
--spec start_link({'local', atom()}, rabbit_types:mfargs()) ->
-          rabbit_types:ok_pid_or_error().
--spec start_link_worker({'local', atom()}, rabbit_types:mfargs()) ->
-          rabbit_types:ok_pid_or_error().
-
-%%----------------------------------------------------------------------------
 
 start_link(Callback) ->
     supervisor2:start_link(?MODULE, Callback).
 
+-spec start_link({'local', atom()}, rabbit_types:mfargs()) ->
+          rabbit_types:ok_pid_or_error().
+
 start_link(SupName, Callback) ->
     supervisor2:start_link(SupName, ?MODULE, Callback).
+
+-spec start_link_worker({'local', atom()}, rabbit_types:mfargs()) ->
+          rabbit_types:ok_pid_or_error().
 
 start_link_worker(SupName, Callback) ->
     supervisor2:start_link(SupName, ?MODULE, {Callback, worker}).

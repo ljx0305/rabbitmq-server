@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(background_gc).
@@ -32,13 +32,11 @@
 %%----------------------------------------------------------------------------
 
 -spec start_link() -> {'ok', pid()} | {'error', any()}.
--spec run() -> 'ok'.
--spec gc() -> 'ok'.
-
-%%----------------------------------------------------------------------------
 
 start_link() -> gen_server2:start_link({local, ?MODULE}, ?MODULE, [],
                                        [{timeout, infinity}]).
+
+-spec run() -> 'ok'.
 
 run() -> gen_server2:cast(?MODULE, run).
 
@@ -73,8 +71,10 @@ interval_gc(State = #state{last_interval = LastInterval}) ->
     erlang:send_after(Interval, self(), run),
     State#state{last_interval = Interval}.
 
+-spec gc() -> 'ok'.
+
 gc() ->
-    Enabled = rabbit_misc:get_env(rabbit, background_gc_enabled, true),
+    Enabled = rabbit_misc:get_env(rabbit, background_gc_enabled, false),
     case Enabled of
         true ->
             [garbage_collect(P) || P <- processes(),

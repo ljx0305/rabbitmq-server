@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2011-2017 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2011-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(unit_inbroker_non_parallel_SUITE).
@@ -35,6 +35,7 @@ groups() ->
           app_management, %% Restart RabbitMQ.
           channel_statistics, %% Expect specific statistics.
           disk_monitor, %% Replace rabbit_misc module.
+          disk_monitor_enable,
           file_handle_cache, %% Change FHC limit.
           head_message_timestamp_statistics, %% Expect specific statistics.
           log_management, %% Check log files.
@@ -237,18 +238,20 @@ log_management1(_Config) ->
     %% logging directed to tty (first, remove handlers)
     ok = rabbit:stop(),
     ok = clean_logs([LogFile], Suffix),
-    ok = application:set_env(rabbit, lager_handler, tty),
+    ok = application:set_env(rabbit, lager_default_file, tty),
+    application:unset_env(rabbit, log),
     application:unset_env(lager, handlers),
     application:unset_env(lager, extra_sinks),
     ok = rabbit:start(),
     timer:sleep(200),
     rabbit_log:info("test info"),
-    [{error, enoent}] = empty_files([LogFile]),
+    [{error, enoent}] = non_empty_files([LogFile]),
 
     %% rotate logs when logging is turned off
     ok = rabbit:stop(),
     ok = clean_logs([LogFile], Suffix),
-    ok = application:set_env(rabbit, lager_handler, false),
+    ok = application:set_env(rabbit, lager_default_file, false),
+    application:unset_env(rabbit, log),
     application:unset_env(lager, handlers),
     application:unset_env(lager, extra_sinks),
     ok = rabbit:start(),
@@ -260,7 +263,8 @@ log_management1(_Config) ->
     %% cleanup
     ok = rabbit:stop(),
     ok = clean_logs([LogFile], Suffix),
-    ok = application:set_env(rabbit, lager_handler, LogFile),
+    ok = application:set_env(rabbit, lager_default_file, LogFile),
+    application:unset_env(rabbit, log),
     application:unset_env(lager, handlers),
     application:unset_env(lager, extra_sinks),
     ok = rabbit:start(),
@@ -278,7 +282,8 @@ log_management_during_startup1(_Config) ->
     %% start application with simple tty logging
     ok = rabbit:stop(),
     ok = clean_logs([LogFile], Suffix),
-    ok = application:set_env(rabbit, lager_handler, tty),
+    ok = application:set_env(rabbit, lager_default_file, tty),
+    application:unset_env(rabbit, log),
     application:unset_env(lager, handlers),
     application:unset_env(lager, extra_sinks),
     ok = rabbit:start(),
@@ -288,7 +293,8 @@ log_management_during_startup1(_Config) ->
     delete_file(NonExistent),
     delete_file(filename:dirname(NonExistent)),
     ok = rabbit:stop(),
-    ok = application:set_env(rabbit, lager_handler, NonExistent),
+    ok = application:set_env(rabbit, lager_default_file, NonExistent),
+    application:unset_env(rabbit, log),
     application:unset_env(lager, handlers),
     application:unset_env(lager, extra_sinks),
     ok = rabbit:start(),
@@ -300,7 +306,8 @@ log_management_during_startup1(_Config) ->
     delete_file(NoPermission1),
     delete_file(filename:dirname(NoPermission1)),
     ok = rabbit:stop(),
-    ok = application:set_env(rabbit, lager_handler, NoPermission1),
+    ok = application:set_env(rabbit, lager_default_file, NoPermission1),
+    application:unset_env(rabbit, log),
     application:unset_env(lager, handlers),
     application:unset_env(lager, extra_sinks),
     ok = try rabbit:start() of
@@ -325,12 +332,13 @@ log_management_during_startup1(_Config) ->
         ok                         -> ok;
         {error, lager_not_running} -> ok
     end,
-    ok = application:set_env(rabbit, lager_handler, NoPermission2),
+    ok = application:set_env(rabbit, lager_default_file, NoPermission2),
+    application:unset_env(rabbit, log),
     application:unset_env(lager, handlers),
     application:unset_env(lager, extra_sinks),
     ok = try rabbit:start() of
         ok -> exit({got_success_but_expected_failure,
-                    log_rotatation_parent_dirs_test})
+                    log_rotation_parent_dirs_test})
     catch
         _:{error, {cannot_log_to_file, _, Reason2}}
             when Reason2 =:= enoent orelse Reason2 =:= eacces -> ok;
@@ -342,7 +350,8 @@ log_management_during_startup1(_Config) ->
     end,
 
     %% cleanup
-    ok = application:set_env(rabbit, lager_handler, LogFile),
+    ok = application:set_env(rabbit, lager_default_file, LogFile),
+    application:unset_env(rabbit, log),
     application:unset_env(lager, handlers),
     application:unset_env(lager, extra_sinks),
     ok = rabbit:start(),
@@ -482,24 +491,24 @@ channel_statistics1(_Config) ->
 
     %% Check the stats reflect that
     Check2 = fun() ->
-                 [{{Ch, QRes}, 1, 0, 0, 0, 0, 0, 0}] = ets:lookup(
-                                                         channel_queue_metrics,
-                                                         {Ch, QRes}),
-                 [{{Ch, X}, 1, 0, 0, 0}] = ets:lookup(
-                                             channel_exchange_metrics,
-                                             {Ch, X}),
-                 [{{Ch, {QRes, X}}, 1, 0}] = ets:lookup(
-                                               channel_queue_exchange_metrics,
-                                               {Ch, {QRes, X}})
+                     [{{Ch, QRes}, 1, 0, 0, 0, 0, 0, 0, 0}] = ets:lookup(
+                                                                channel_queue_metrics,
+                                                                {Ch, QRes}),
+                     [{{Ch, X}, 1, 0, 0, 0}] = ets:lookup(
+                                                 channel_exchange_metrics,
+                                                 {Ch, X}),
+                     [{{Ch, {QRes, X}}, 1, 0}] = ets:lookup(
+                                                   channel_queue_exchange_metrics,
+                                                   {Ch, {QRes, X}})
              end,
     test_ch_metrics(Check2, ?TIMEOUT),
 
     %% Check the stats are marked for removal on queue deletion.
     rabbit_channel:do(Ch, #'queue.delete'{queue = QName}),
     Check3 = fun() ->
-                 [{{Ch, QRes}, 1, 0, 0, 0, 0, 0, 1}] = ets:lookup(
-                                                         channel_queue_metrics,
-                                                         {Ch, QRes}),
+                     [{{Ch, QRes}, 1, 0, 0, 0, 0, 0, 0, 1}] = ets:lookup(
+                                                                channel_queue_metrics,
+                                                                {Ch, QRes}),
                  [{{Ch, X}, 1, 0, 0, 0}] = ets:lookup(
                                              channel_exchange_metrics,
                                              {Ch, X}),
@@ -559,7 +568,7 @@ head_message_timestamp1(_Config) ->
     QRes = rabbit_misc:r(<<"/">>, queue, QName),
 
     {ok, Q1} = rabbit_amqqueue:lookup(QRes),
-    QPid = Q1#amqqueue.pid,
+    QPid = amqqueue:get_pid(Q1),
 
     %% Set up event receiver for queue
     dummy_event_receiver:start(self(), [node()], [queue_stats]),
@@ -629,6 +638,37 @@ disk_monitor1(_Config) ->
     ok = rabbit_sup:stop_child(rabbit_disk_monitor_sup),
     ok = rabbit_sup:start_delayed_restartable_child(rabbit_disk_monitor, [1000]),
     meck:unload(rabbit_misc),
+    passed.
+
+disk_monitor_enable(Config) ->
+    passed = rabbit_ct_broker_helpers:rpc(Config, 0,
+      ?MODULE, disk_monitor_enable1, [Config]).
+
+disk_monitor_enable1(_Config) ->
+    case os:type() of
+        {unix, _} ->
+            disk_monitor_enable1();
+        _ ->
+            %% skip windows testing
+            skipped
+    end.
+
+disk_monitor_enable1() ->
+    ok = meck:new(rabbit_misc, [passthrough]),
+    ok = meck:expect(rabbit_misc, os_cmd, fun(_) -> "\n" end),
+    application:set_env(rabbit, disk_monitor_failure_retries, 20000),
+    application:set_env(rabbit, disk_monitor_failure_retry_interval, 100),
+    ok = rabbit_sup:stop_child(rabbit_disk_monitor_sup),
+    ok = rabbit_sup:start_delayed_restartable_child(rabbit_disk_monitor, [1000]),
+    undefined = rabbit_disk_monitor:get_disk_free(),
+    Cmd = "Filesystem 1024-blocks      Used Available Capacity  iused     ifree %iused  Mounted on\n/dev/disk1   975798272 234783364 740758908    25% 58759839 185189727   24%   /\n",
+    ok = meck:expect(rabbit_misc, os_cmd, fun(_) -> Cmd end),
+    timer:sleep(1000),
+    Bytes = 740758908 * 1024,
+    Bytes = rabbit_disk_monitor:get_disk_free(),
+    meck:unload(rabbit_misc),
+    application:set_env(rabbit, disk_monitor_failure_retries, 10),
+    application:set_env(rabbit, disk_monitor_failure_retry_interval, 120000),
     passed.
 
 %% ---------------------------------------------------------------------------

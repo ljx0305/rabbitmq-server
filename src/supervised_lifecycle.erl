@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 %% Invoke callbacks on startup and termination.
@@ -38,8 +38,6 @@
 
 -spec start_link(atom(), rabbit_types:mfargs(), rabbit_types:mfargs()) ->
           rabbit_types:ok_pid_or_error().
-
-%%----------------------------------------------------------------------------
 
 start_link(Name, StartMFA, StopMFA) ->
     gen_server:start_link({local, Name}, ?MODULE, [StartMFA, StopMFA], []).

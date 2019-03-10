@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_exchange_parameters).
@@ -22,8 +22,6 @@
 
 -export([register/0]).
 -export([validate/5, notify/5, notify_clear/4]).
-
--import(rabbit_misc, [pget/2]).
 
 -rabbit_boot_step({?MODULE,
                    [{description, "exchange parameters"},
@@ -36,7 +34,8 @@ register() ->
                              ?EXCHANGE_DELETE_IN_PROGRESS_COMPONENT, ?MODULE),
     %% ensure there are no leftovers from before node restart/crash
     rabbit_runtime_parameters:clear_component(
-      ?EXCHANGE_DELETE_IN_PROGRESS_COMPONENT),
+      ?EXCHANGE_DELETE_IN_PROGRESS_COMPONENT,
+      ?INTERNAL_USER),
     ok.
 
 validate(_VHost, ?EXCHANGE_DELETE_IN_PROGRESS_COMPONENT, _Name, _Term, _User) ->

@@ -13,7 +13,7 @@ REM
 REM  The Original Code is RabbitMQ.
 REM
 REM  The Initial Developer of the Original Code is GoPivotal, Inc.
-REM  Copyright (c) 2007-2015 Pivotal Software, Inc.  All rights reserved.
+REM  Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 REM
 
 setlocal
@@ -45,17 +45,21 @@ if not defined ERL_CRASH_DUMP_SECONDS (
     set ERL_CRASH_DUMP_SECONDS=0
 )
 
-"!ERLANG_HOME!\bin\escript.exe" ^
-"%RABBITMQ_HOME%\escript\rabbitmq-plugins" --formatter=plugins !STAR!
-rem -pa "!RABBITMQ_HOME!\ebin" ^
-rem -noinput ^
-rem -hidden ^
-rem !RABBITMQ_CTL_ERL_ARGS! ^
-rem -s rabbit_plugins_main ^
-rem -enabled_plugins_file "!RABBITMQ_ENABLED_PLUGINS_FILE!" ^
-rem -plugins_dist_dir "!RABBITMQ_PLUGINS_DIR:\=/!" ^
-rem -nodename !RABBITMQ_NODENAME! ^
-rem -extra !STAR!
+"!ERLANG_HOME!\bin\erl.exe" +B ^
+-boot !CLEAN_BOOT_FILE! ^
+-noinput -noshell -hidden -smp enable ^
+!RABBITMQ_CTL_ERL_ARGS! ^
+-kernel inet_dist_listen_min !RABBITMQ_CTL_DIST_PORT_MIN! ^
+-kernel inet_dist_listen_max !RABBITMQ_CTL_DIST_PORT_MAX! ^
+-sasl errlog_type error ^
+-mnesia dir \""!RABBITMQ_MNESIA_DIR:\=/!"\" ^
+-run escript start ^
+-escript main rabbitmqctl_escript ^
+-extra "%RABBITMQ_HOME%\escript\rabbitmq-plugins" !STAR!
+
+if ERRORLEVEL 1 (
+    exit /B 1
+)
 
 endlocal
 endlocal

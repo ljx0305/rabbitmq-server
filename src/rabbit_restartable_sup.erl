@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_restartable_sup).
@@ -30,8 +30,6 @@
 
 -spec start_link(atom(), rabbit_types:mfargs(), boolean()) ->
                            rabbit_types:ok_pid_or_error().
-
-%%----------------------------------------------------------------------------
 
 start_link(Name, {_M, _F, _A} = Fun, Delay) ->
     supervisor2:start_link({local, Name}, ?MODULE, [Fun, Delay]).

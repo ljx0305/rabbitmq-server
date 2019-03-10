@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2011-2017 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2011-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(unit_inbroker_parallel_SUITE).
@@ -19,11 +19,13 @@
 -include_lib("common_test/include/ct.hrl").
 -include_lib("kernel/include/file.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
+-include_lib("eunit/include/eunit.hrl").
 
 -compile(export_all).
 
 -define(TIMEOUT_LIST_OPS_PASS, 5000).
 -define(TIMEOUT, 30000).
+-define(TIMEOUT_CHANNEL_EXCEPTION, 5000).
 
 -define(CLEANUP_QUEUE_NAME, <<"cleanup-queue">>).
 
@@ -33,11 +35,19 @@ all() ->
     ].
 
 groups() ->
+    MaxLengthTests = [max_length_default,
+                      max_length_bytes_default,
+                      max_length_drop_head,
+                      max_length_bytes_drop_head,
+                      max_length_reject_confirm,
+                      max_length_bytes_reject_confirm,
+                      max_length_drop_publish,
+                      max_length_drop_publish_requeue,
+                      max_length_bytes_drop_publish],
     [
       {parallel_tests, [parallel], [
           amqp_connection_refusal,
           configurable_server_properties,
-          confirms,
           credit_flow_settings,
           dynamic_mirroring,
           gen_server2_with_state,
@@ -46,8 +56,29 @@ groups() ->
               password_hashing,
               change_password
             ]},
-          topic_matching
-        ]}
+          {auth_backend_internal, [parallel], [
+              login_with_credentials_but_no_password,
+              login_of_passwordless_user,
+              set_tags_for_passwordless_user
+            ]},
+          set_disk_free_limit_command,
+          set_vm_memory_high_watermark_command,
+          topic_matching,
+          max_message_size,
+
+          {queue_max_length, [], [
+                                  {max_length_classic, [], MaxLengthTests},
+                                  {max_length_quorum, [], [max_length_default,
+                                                           max_length_bytes_default]
+                                  },
+                                  {max_length_mirrored, [], MaxLengthTests}
+                                 ]}
+       ]}
+    ].
+
+suite() ->
+    [
+      {timetrap, {minutes, 3}}
     ].
 
 %% -------------------------------------------------------------------
@@ -61,6 +92,29 @@ init_per_suite(Config) ->
 end_per_suite(Config) ->
     rabbit_ct_helpers:run_teardown_steps(Config).
 
+init_per_group(max_length_classic, Config) ->
+    rabbit_ct_helpers:set_config(
+      Config,
+      [{queue_args, [{<<"x-queue-type">>, longstr, <<"classic">>}]},
+       {queue_durable, false}]);
+init_per_group(max_length_quorum, Config) ->
+    case rabbit_ct_broker_helpers:enable_feature_flag(Config, quorum_queue) of
+        ok ->
+            rabbit_ct_helpers:set_config(
+              Config,
+              [{queue_args, [{<<"x-queue-type">>, longstr, <<"quorum">>}]},
+               {queue_durable, true}]);
+        Skip ->
+            Skip
+    end;
+init_per_group(max_length_mirrored, Config) ->
+    rabbit_ct_broker_helpers:set_ha_policy(Config, 0, <<"^max_length.*queue">>,
+        <<"all">>, [{<<"ha-sync-mode">>, <<"automatic">>}]),
+    Config1 = rabbit_ct_helpers:set_config(
+                Config, [{is_mirrored, true},
+                         {queue_args, [{<<"x-queue-type">>, longstr, <<"classic">>}]},
+                         {queue_durable, false}]),
+    rabbit_ct_helpers:run_steps(Config1, []);
 init_per_group(Group, Config) ->
     case lists:member({group, Group}, all()) of
         true ->
@@ -89,6 +143,12 @@ setup_file_handle_cache1() ->
     ok = file_handle_cache:set_limit(10),
     ok.
 
+end_per_group(max_length_mirrored, Config) ->
+    rabbit_ct_broker_helpers:clear_policy(Config, 0, <<"^max_length.*queue">>),
+    Config1 = rabbit_ct_helpers:set_config(Config, [{is_mirrored, false}]),
+    Config1;
+end_per_group(queue_max_length, Config) ->
+    Config;
 end_per_group(Group, Config) ->
     case lists:member({group, Group}, all()) of
         true ->
@@ -100,7 +160,21 @@ end_per_group(Group, Config) ->
     end.
 
 init_per_testcase(Testcase, Config) ->
-    rabbit_ct_helpers:testcase_started(Config, Testcase).
+    Group = proplists:get_value(name, ?config(tc_group_properties, Config)),
+    Q = rabbit_data_coercion:to_binary(io_lib:format("~p_~p", [Group, Testcase])),
+    Config1 = rabbit_ct_helpers:set_config(Config, [{queue_name, Q}]),
+    rabbit_ct_helpers:testcase_started(Config1, Testcase).
+
+end_per_testcase(Testcase, Config)
+  when Testcase == max_length_drop_publish; Testcase == max_length_bytes_drop_publish;
+       Testcase == max_length_drop_publish_requeue;
+       Testcase == max_length_reject_confirm; Testcase == max_length_bytes_reject_confirm;
+       Testcase == max_length_drop_head; Testcase == max_length_bytes_drop_head;
+       Testcase == max_length_default; Testcase == max_length_bytes_default ->
+    {_, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    amqp_channel:call(Ch, #'queue.delete'{queue = ?config(queue_name, Config)}),
+    rabbit_ct_client_helpers:close_channels_and_connection(Config, 0),
+    rabbit_ct_helpers:testcase_finished(Config, Testcase);
 
 end_per_testcase(Testcase, Config) ->
     rabbit_ct_helpers:testcase_finished(Config, Testcase).
@@ -146,7 +220,7 @@ on_disk_stop(Pid) ->
     end.
 
 queue_name(Config, Name) ->
-    Name1 = rabbit_ct_helpers:config_to_testcase_name(Config, Name),
+    Name1 = iolist_to_binary(rabbit_ct_helpers:config_to_testcase_name(Config, Name)),
     queue_name(Name1).
 
 queue_name(Name) ->
@@ -199,8 +273,7 @@ wait_for_confirms(Unconfirmed) ->
     end.
 
 test_amqqueue(Durable) ->
-    (rabbit_amqqueue:pseudo_queue(test_queue(), self()))
-        #amqqueue { durable = Durable }.
+    rabbit_amqqueue:pseudo_queue(test_queue(), self(), Durable).
 
 assert_prop(List, Prop, Value) ->
     case proplists:get_value(Prop, List)of
@@ -336,26 +409,6 @@ override_group_leader() ->
     %% the error_logger local to RabbitMQ.
     {group_leader, Leader} = erlang:process_info(whereis(rabbit), group_leader),
     erlang:group_leader(Leader, self()).
-
-empty_files(Files) ->
-    [case file:read_file_info(File) of
-         {ok, FInfo} -> FInfo#file_info.size == 0;
-         Error       -> Error
-     end || File <- Files].
-
-non_empty_files(Files) ->
-    [case EmptyFile of
-         {error, Reason} -> {error, Reason};
-         _               -> not(EmptyFile)
-     end || EmptyFile <- empty_files(Files)].
-
-test_logs_working(MainLogFile, SaslLogFile) ->
-    ok = rabbit_log:error("Log a test message~n"),
-    ok = error_logger:error_report(crash_report, [fake_crash_report, ?MODULE]),
-    %% give the error loggers some time to catch up
-    timer:sleep(100),
-    [true, true] = non_empty_files([MainLogFile, SaslLogFile]),
-    ok.
 
 set_permissions(Path, Mode) ->
     case file:read_file_info(Path) of
@@ -497,6 +550,96 @@ change_password1(_Config) ->
             UserName, [{password, Password}]),
     passed.
 
+
+%% -------------------------------------------------------------------
+%% rabbit_auth_backend_internal
+%% -------------------------------------------------------------------
+
+login_with_credentials_but_no_password(Config) ->
+    passed = rabbit_ct_broker_helpers:rpc(Config, 0,
+      ?MODULE, login_with_credentials_but_no_password1, [Config]).
+
+login_with_credentials_but_no_password1(_Config) ->
+    Username = <<"login_with_credentials_but_no_password-user">>,
+    Password = <<"login_with_credentials_but_no_password-password">>,
+    ok = rabbit_auth_backend_internal:add_user(Username, Password, <<"acting-user">>),
+
+    try
+        rabbit_auth_backend_internal:user_login_authentication(Username,
+                                                              [{key, <<"value">>}]),
+        ?assert(false)
+    catch exit:{unknown_auth_props, Username, [{key, <<"value">>}]} ->
+            ok
+    end,
+
+    ok = rabbit_auth_backend_internal:delete_user(Username, <<"acting-user">>),
+
+    passed.
+
+%% passwordless users are not supposed to be used with
+%% this backend (and PLAIN authentication mechanism in general)
+login_of_passwordless_user(Config) ->
+    passed = rabbit_ct_broker_helpers:rpc(Config, 0,
+      ?MODULE, login_of_passwordless_user1, [Config]).
+
+login_of_passwordless_user1(_Config) ->
+    Username = <<"login_of_passwordless_user-user">>,
+    Password = <<"">>,
+    ok = rabbit_auth_backend_internal:add_user(Username, Password, <<"acting-user">>),
+
+    ?assertMatch(
+       {refused, _Message, [Username]},
+       rabbit_auth_backend_internal:user_login_authentication(Username,
+                                                              [{password, <<"">>}])),
+
+    ?assertMatch(
+       {refused, _Format, [Username]},
+       rabbit_auth_backend_internal:user_login_authentication(Username,
+                                                              [{password, ""}])),
+
+    ok = rabbit_auth_backend_internal:delete_user(Username, <<"acting-user">>),
+
+    passed.
+
+
+set_tags_for_passwordless_user(Config) ->
+    passed = rabbit_ct_broker_helpers:rpc(Config, 0,
+      ?MODULE, set_tags_for_passwordless_user1, [Config]).
+
+set_tags_for_passwordless_user1(_Config) ->
+    Username = <<"set_tags_for_passwordless_user">>,
+    Password = <<"set_tags_for_passwordless_user">>,
+    ok = rabbit_auth_backend_internal:add_user(Username, Password,
+                                               <<"acting-user">>),
+    ok = rabbit_auth_backend_internal:clear_password(Username,
+                                                     <<"acting-user">>),
+    ok = rabbit_auth_backend_internal:set_tags(Username, [management],
+                                               <<"acting-user">>),
+
+    ?assertMatch(
+       {ok, #internal_user{tags = [management]}},
+       rabbit_auth_backend_internal:lookup_user(Username)),
+
+    ok = rabbit_auth_backend_internal:set_tags(Username, [management, policymaker],
+                                               <<"acting-user">>),
+
+    ?assertMatch(
+       {ok, #internal_user{tags = [management, policymaker]}},
+       rabbit_auth_backend_internal:lookup_user(Username)),
+
+    ok = rabbit_auth_backend_internal:set_tags(Username, [],
+                                               <<"acting-user">>),
+
+    ?assertMatch(
+       {ok, #internal_user{tags = []}},
+       rabbit_auth_backend_internal:lookup_user(Username)),
+
+    ok = rabbit_auth_backend_internal:delete_user(Username,
+                                                  <<"acting-user">>),
+
+    passed.
+
+
 %% -------------------------------------------------------------------
 %% rabbitmqctl.
 %% -------------------------------------------------------------------
@@ -555,7 +698,7 @@ head_message_timestamp1(_Config) ->
     QRes = rabbit_misc:r(<<"/">>, queue, QName),
 
     {ok, Q1} = rabbit_amqqueue:lookup(QRes),
-    QPid = Q1#amqqueue.pid,
+    QPid = amqqueue:get_pid(Q1),
 
     %% Set up event receiver for queue
     dummy_event_receiver:start(self(), [node()], [queue_stats]),
@@ -778,71 +921,6 @@ test_topic_expect_match(X, List) ->
 %% ---------------------------------------------------------------------------
 %% Unordered tests (originally from rabbit_tests.erl).
 %% ---------------------------------------------------------------------------
-
-confirms(Config) ->
-    passed = rabbit_ct_broker_helpers:rpc(Config, 0,
-      ?MODULE, confirms1, [Config]).
-
-confirms1(_Config) ->
-    {_Writer, Ch} = test_spawn(),
-    DeclareBindDurableQueue =
-        fun() ->
-                rabbit_channel:do(Ch, #'queue.declare'{durable = true}),
-                receive #'queue.declare_ok'{queue = Q0} ->
-                        rabbit_channel:do(Ch, #'queue.bind'{
-                                                 queue = Q0,
-                                                 exchange = <<"amq.direct">>,
-                                                 routing_key = "confirms-magic" }),
-                        receive #'queue.bind_ok'{} -> Q0
-                        after ?TIMEOUT -> throw(failed_to_bind_queue)
-                        end
-                after ?TIMEOUT -> throw(failed_to_declare_queue)
-                end
-        end,
-    %% Declare and bind two queues
-    QName1 = DeclareBindDurableQueue(),
-    QName2 = DeclareBindDurableQueue(),
-    %% Get the first one's pid (we'll crash it later)
-    {ok, Q1} = rabbit_amqqueue:lookup(rabbit_misc:r(<<"/">>, queue, QName1)),
-    QPid1 = Q1#amqqueue.pid,
-    %% Enable confirms
-    rabbit_channel:do(Ch, #'confirm.select'{}),
-    receive
-        #'confirm.select_ok'{} -> ok
-    after ?TIMEOUT -> throw(failed_to_enable_confirms)
-    end,
-    %% Publish a message
-    rabbit_channel:do(Ch, #'basic.publish'{exchange = <<"amq.direct">>,
-                                           routing_key = "confirms-magic"
-                                          },
-                      rabbit_basic:build_content(
-                        #'P_basic'{delivery_mode = 2}, <<"">>)),
-    %% We must not kill the queue before the channel has processed the
-    %% 'publish'.
-    ok = rabbit_channel:flush(Ch),
-    %% Crash the queue
-    QPid1 ! boom,
-    %% Wait for a nack
-    receive
-        #'basic.nack'{} -> ok;
-        #'basic.ack'{}  -> throw(received_ack_instead_of_nack)
-    after ?TIMEOUT-> throw(did_not_receive_nack)
-    end,
-    receive
-        #'basic.ack'{} -> throw(received_ack_when_none_expected)
-    after 1000 -> ok
-    end,
-    %% Cleanup
-    rabbit_channel:do(Ch, #'queue.delete'{queue = QName2}),
-    receive
-        #'queue.delete_ok'{} -> ok
-    after ?TIMEOUT -> throw(failed_to_cleanup_queue)
-    end,
-    unlink(Ch),
-    ok = rabbit_channel:shutdown(Ch),
-
-    passed.
-
 gen_server2_with_state(Config) ->
     passed = rabbit_ct_broker_helpers:rpc(Config, 0,
       ?MODULE, gen_server2_with_state1, [Config]).
@@ -992,6 +1070,347 @@ configurable_server_properties1(_Config) ->
     application:set_env(rabbit, server_properties, ServerProperties),
     passed.
 
+set_disk_free_limit_command(Config) ->
+    passed = rabbit_ct_broker_helpers:rpc(Config, 0,
+      ?MODULE, set_disk_free_limit_command1, [Config]).
+
+set_disk_free_limit_command1(_Config) ->
+    rabbit_disk_monitor:set_disk_free_limit("2000kiB"),
+    2048000 = rabbit_disk_monitor:get_disk_free_limit(),
+
+    %% Use an integer
+    rabbit_disk_monitor:set_disk_free_limit({mem_relative, 1}),
+    disk_free_limit_to_total_memory_ratio_is(1),
+
+    %% Use a float
+    rabbit_disk_monitor:set_disk_free_limit({mem_relative, 1.5}),
+    disk_free_limit_to_total_memory_ratio_is(1.5),
+
+    rabbit_disk_monitor:set_disk_free_limit("50MB"),
+    passed.
+
+disk_free_limit_to_total_memory_ratio_is(MemRatio) ->
+    ExpectedLimit = MemRatio * vm_memory_monitor:get_total_memory(),
+    % Total memory is unstable, so checking order
+    true = ExpectedLimit/rabbit_disk_monitor:get_disk_free_limit() < 1.2,
+    true = ExpectedLimit/rabbit_disk_monitor:get_disk_free_limit() > 0.98.
+
+set_vm_memory_high_watermark_command(Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0,
+      ?MODULE, set_vm_memory_high_watermark_command1, [Config]).
+
+set_vm_memory_high_watermark_command1(_Config) ->
+    MemLimitRatio = 1.0,
+    MemTotal = vm_memory_monitor:get_total_memory(),
+
+    vm_memory_monitor:set_vm_memory_high_watermark(MemLimitRatio),
+    MemLimit = vm_memory_monitor:get_memory_limit(),
+    case MemLimit of
+        MemTotal -> ok;
+        _        -> MemTotalToMemLimitRatio = MemLimit * 100.0 / MemTotal / 100,
+                    ct:fail(
+                        "Expected memory high watermark to be ~p (~s), but it was ~p (~.1f)",
+                        [MemTotal, MemLimitRatio, MemLimit, MemTotalToMemLimitRatio]
+                    )
+    end.
+
+max_length_bytes_drop_head(Config) ->
+    max_length_bytes_drop_head(Config, [{<<"x-overflow">>, longstr, <<"drop-head">>}]).
+
+max_length_bytes_default(Config) ->
+    max_length_bytes_drop_head(Config, []).
+
+max_length_bytes_drop_head(Config, ExtraArgs) ->
+    {_Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Args = ?config(queue_args, Config),
+    Durable = ?config(queue_durable, Config),
+    QName = ?config(queue_name, Config),
+
+    MaxLengthBytesArgs = [{<<"x-max-length-bytes">>, long, 100}],
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName, arguments = MaxLengthBytesArgs ++ Args ++ ExtraArgs, durable = Durable}),
+
+    %% 80 bytes payload
+    Payload1 = << <<"1">> || _ <- lists:seq(1, 80) >>,
+    Payload2 = << <<"2">> || _ <- lists:seq(1, 80) >>,
+    Payload3 = << <<"3">> || _ <- lists:seq(1, 80) >>,
+    check_max_length_drops_head(Config, QName, Ch, Payload1, Payload2, Payload3).
+
+max_length_drop_head(Config) ->
+    max_length_drop_head(Config, [{<<"x-overflow">>, longstr, <<"drop-head">>}]).
+
+max_length_default(Config) ->
+    %% Defaults to drop_head
+    max_length_drop_head(Config, []).
+
+max_length_drop_head(Config, ExtraArgs) ->
+    {_Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Args = ?config(queue_args, Config),
+    Durable = ?config(queue_durable, Config),
+    QName = ?config(queue_name, Config),
+
+    MaxLengthArgs = [{<<"x-max-length">>, long, 1}],
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName, arguments = MaxLengthArgs ++ Args ++ ExtraArgs, durable = Durable}),
+
+    check_max_length_drops_head(Config, QName, Ch, <<"1">>, <<"2">>, <<"3">>).
+
+max_length_reject_confirm(Config) ->
+    {_Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Args = ?config(queue_args, Config),
+    QName = ?config(queue_name, Config),
+    Durable = ?config(queue_durable, Config),
+    MaxLengthArgs = [{<<"x-max-length">>, long, 1}],
+    OverflowArgs = [{<<"x-overflow">>, longstr, <<"reject-publish">>}],
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName, arguments = MaxLengthArgs ++ OverflowArgs ++ Args, durable = Durable}),
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+    check_max_length_drops_publish(Config, QName, Ch, <<"1">>, <<"2">>, <<"3">>),
+    check_max_length_rejects(Config, QName, Ch, <<"1">>, <<"2">>, <<"3">>).
+
+max_length_bytes_reject_confirm(Config) ->
+    {_Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Args = ?config(queue_args, Config),
+    QNameBytes = ?config(queue_name, Config),
+    Durable = ?config(queue_durable, Config),
+    MaxLengthBytesArgs = [{<<"x-max-length-bytes">>, long, 100}],
+    OverflowArgs = [{<<"x-overflow">>, longstr, <<"reject-publish">>}],
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QNameBytes, arguments = MaxLengthBytesArgs ++ OverflowArgs ++ Args, durable = Durable}),
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+
+    %% 80 bytes payload
+    Payload1 = << <<"1">> || _ <- lists:seq(1, 80) >>,
+    Payload2 = << <<"2">> || _ <- lists:seq(1, 80) >>,
+    Payload3 = << <<"3">> || _ <- lists:seq(1, 80) >>,
+
+    check_max_length_drops_publish(Config, QNameBytes, Ch, Payload1, Payload2, Payload3),
+    check_max_length_rejects(Config, QNameBytes, Ch, Payload1, Payload2, Payload3).
+
+max_length_drop_publish(Config) ->
+    {_Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Args = ?config(queue_args, Config),
+    Durable = ?config(queue_durable, Config),
+    QName = ?config(queue_name, Config),
+    MaxLengthArgs = [{<<"x-max-length">>, long, 1}],
+    OverflowArgs = [{<<"x-overflow">>, longstr, <<"reject-publish">>}],
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName, arguments = MaxLengthArgs ++ OverflowArgs ++ Args, durable = Durable}),
+    %% If confirms are not enable, publishes will still be dropped in reject-publish mode.
+    check_max_length_drops_publish(Config, QName, Ch, <<"1">>, <<"2">>, <<"3">>).
+
+max_length_drop_publish_requeue(Config) ->
+    {_Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Args = ?config(queue_args, Config),
+    Durable = ?config(queue_durable, Config),
+    QName = ?config(queue_name, Config),
+    MaxLengthArgs = [{<<"x-max-length">>, long, 1}],
+    OverflowArgs = [{<<"x-overflow">>, longstr, <<"reject-publish">>}],
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName, arguments = MaxLengthArgs ++ OverflowArgs ++ Args, durable = Durable}),
+    %% If confirms are not enable, publishes will still be dropped in reject-publish mode.
+    check_max_length_requeue(Config, QName, Ch, <<"1">>, <<"2">>).
+
+check_max_length_requeue(Config, QName, Ch, Payload1, Payload2) ->
+    sync_mirrors(QName, Config),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    %% A single message is published and consumed
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload1}),
+    wait_for_consensus(QName, Config),
+    {#'basic.get_ok'{delivery_tag = DeliveryTag},
+     #amqp_msg{payload = Payload1}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+
+    %% Another message is published
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload2}),
+    wait_for_consensus(QName, Config),
+    amqp_channel:cast(Ch, #'basic.nack'{delivery_tag = DeliveryTag,
+                                        multiple     = false,
+                                        requeue      = true}),
+    wait_for_consensus(QName, Config),
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload1}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload2}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}).
+
+max_length_bytes_drop_publish(Config) ->
+    {_Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Args = ?config(queue_args, Config),
+    Durable = ?config(queue_durable, Config),
+    QNameBytes = ?config(queue_name, Config),
+    MaxLengthBytesArgs = [{<<"x-max-length-bytes">>, long, 100}],
+    OverflowArgs = [{<<"x-overflow">>, longstr, <<"reject-publish">>}],
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QNameBytes, arguments = MaxLengthBytesArgs ++ OverflowArgs ++ Args, durable = Durable}),
+
+    %% 80 bytes payload
+    Payload1 = << <<"1">> || _ <- lists:seq(1, 80) >>,
+    Payload2 = << <<"2">> || _ <- lists:seq(1, 80) >>,
+    Payload3 = << <<"3">> || _ <- lists:seq(1, 80) >>,
+
+    check_max_length_drops_publish(Config, QNameBytes, Ch, Payload1, Payload2, Payload3).
+
+check_max_length_drops_publish(Config, QName, Ch, Payload1, Payload2, Payload3) ->
+    sync_mirrors(QName, Config),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    %% A single message is published and consumed
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload1}),
+    wait_for_consensus(QName, Config),
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload1}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+
+    %% Message 2 is dropped, message 1 stays
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload1}),
+    wait_for_consensus(QName, Config),
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload2}),
+    wait_for_consensus(QName, Config),
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload1}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+
+    %% Messages 2 and 3 are dropped, message 1 stays
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload1}),
+    wait_for_consensus(QName, Config),
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload2}),
+    wait_for_consensus(QName, Config),
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload3}),
+    wait_for_consensus(QName, Config),
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload1}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}).
+
+wait_for_consensus(QName, Config) ->
+    case lists:keyfind(<<"x-queue-type">>, 1, ?config(queue_args, Config)) of
+        {_, _, <<"quorum">>} ->
+            Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+            RaName = binary_to_atom(<<"%2F_", QName/binary>>, utf8),
+            {ok, _, _} = ra:members({RaName, Server});
+        _ ->
+            ok
+    end.
+
+check_max_length_rejects(Config, QName, Ch, Payload1, Payload2, Payload3) ->
+    sync_mirrors(QName, Config),
+    amqp_channel:register_confirm_handler(Ch, self()),
+    flush(),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    %% First message can be enqueued and acks
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload1}),
+    receive #'basic.ack'{} -> ok
+    after 1000 -> error(expected_ack)
+    end,
+
+    %% The message cannot be enqueued and nacks
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload2}),
+    receive #'basic.nack'{} -> ok
+    after 1000 -> error(expected_nack)
+    end,
+
+    %% The message cannot be enqueued and nacks
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload3}),
+    receive #'basic.nack'{} -> ok
+    after 1000 -> error(expected_nack)
+    end,
+
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload1}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+
+    %% Now we can publish message 2.
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload2}),
+    receive #'basic.ack'{} -> ok
+    after 1000 -> error(expected_ack)
+    end,
+
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload2}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}).
+
+check_max_length_drops_head(Config, QName, Ch, Payload1, Payload2, Payload3) ->
+    sync_mirrors(QName, Config),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    %% A single message is published and consumed
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload1}),
+    wait_for_consensus(QName, Config),
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload1}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+
+    %% Message 1 is replaced by message 2
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload1}),
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload2}),
+    wait_for_consensus(QName, Config),
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload2}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+
+    %% Messages 1 and 2 are replaced
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload1}),
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload2}),
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = QName}, #amqp_msg{payload = Payload3}),
+    wait_for_consensus(QName, Config),
+    {#'basic.get_ok'{}, #amqp_msg{payload = Payload3}} = amqp_channel:call(Ch, #'basic.get'{queue = QName}),
+    #'basic.get_empty'{} = amqp_channel:call(Ch, #'basic.get'{queue = QName}).
+
+sync_mirrors(QName, Config) ->
+    case ?config(is_mirrored, Config) of
+        true ->
+            rabbit_ct_broker_helpers:rabbitmqctl(Config, 0, [<<"sync_queue">>, QName]);
+        _ -> ok
+    end.
+
+gen_binary_mb(N) ->
+    B1M = << <<"_">> || _ <- lists:seq(1, 1024 * 1024) >>,
+    << B1M || _ <- lists:seq(1, N) >>.
+
+assert_channel_alive(Ch) ->
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = <<"nope">>},
+                          #amqp_msg{payload = <<"HI">>}).
+
+assert_channel_fail_max_size(Ch, Monitor) ->
+    receive
+        {'DOWN', Monitor, process, Ch,
+            {shutdown,
+                {server_initiated_close, 406, _Error}}} ->
+            ok
+    after ?TIMEOUT_CHANNEL_EXCEPTION ->
+        error({channel_exception_expected, max_message_size})
+    end.
+
+max_message_size(Config) ->
+    Binary2M  = gen_binary_mb(2),
+    Binary4M  = gen_binary_mb(4),
+    Binary6M  = gen_binary_mb(6),
+    Binary10M = gen_binary_mb(10),
+
+    Size2Mb = 1024 * 1024 * 2,
+    Size2Mb = byte_size(Binary2M),
+
+    rabbit_ct_broker_helpers:rpc(Config, 0,
+                                 application, set_env, [rabbit, max_message_size, 1024 * 1024 * 3]),
+
+    {_, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+
+    %% Binary is within the max size limit
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = <<"none">>}, #amqp_msg{payload = Binary2M}),
+    %% The channel process is alive
+    assert_channel_alive(Ch),
+
+    Monitor = monitor(process, Ch),
+    amqp_channel:call(Ch, #'basic.publish'{routing_key = <<"none">>}, #amqp_msg{payload = Binary4M}),
+    assert_channel_fail_max_size(Ch, Monitor),
+
+    %% increase the limit
+    rabbit_ct_broker_helpers:rpc(Config, 0,
+                                 application, set_env, [rabbit, max_message_size, 1024 * 1024 * 8]),
+
+    {_, Ch1} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+
+    amqp_channel:call(Ch1, #'basic.publish'{routing_key = <<"nope">>}, #amqp_msg{payload = Binary2M}),
+    assert_channel_alive(Ch1),
+
+    amqp_channel:call(Ch1, #'basic.publish'{routing_key = <<"nope">>}, #amqp_msg{payload = Binary4M}),
+    assert_channel_alive(Ch1),
+
+    amqp_channel:call(Ch1, #'basic.publish'{routing_key = <<"nope">>}, #amqp_msg{payload = Binary6M}),
+    assert_channel_alive(Ch1),
+
+    Monitor1 = monitor(process, Ch1),
+    amqp_channel:call(Ch1, #'basic.publish'{routing_key = <<"none">>}, #amqp_msg{payload = Binary10M}),
+    assert_channel_fail_max_size(Ch1, Monitor1),
+
+    %% increase beyond the hard limit
+    rabbit_ct_broker_helpers:rpc(Config, 0,
+                                 application, set_env, [rabbit, max_message_size, 1024 * 1024 * 600]),
+    Val = rabbit_ct_broker_helpers:rpc(Config, 0,
+                                       rabbit_channel, get_max_message_size, []),
+
+    ?assertEqual(?MAX_MSG_SIZE, Val).
+
 %% ---------------------------------------------------------------------------
 %% rabbitmqctl helpers.
 %% ---------------------------------------------------------------------------
@@ -1005,3 +1424,8 @@ expand_options(As, Bs) ->
                             false -> [A | R]
                         end
                 end, Bs, As).
+
+flush() ->
+    receive _ -> flush()
+    after 10 -> ok
+    end.

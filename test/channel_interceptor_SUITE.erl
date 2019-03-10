@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2016-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(channel_interceptor_SUITE).
@@ -29,7 +29,8 @@ all() ->
 groups() ->
     [
       {non_parallel_tests, [], [
-          register_interceptor
+          register_interceptor,
+          register_failing_interceptors
         ]}
     ].
 
@@ -71,9 +72,9 @@ end_per_testcase(Testcase, Config) ->
 
 register_interceptor(Config) ->
     passed = rabbit_ct_broker_helpers:rpc(Config, 0,
-      ?MODULE, register_interceptor1, [Config]).
+      ?MODULE, register_interceptor1, [Config, dummy_interceptor]).
 
-register_interceptor1(Config) ->
+register_interceptor1(Config, Interceptor) ->
     PredefinedChannels = rabbit_channel:list(),
 
     Ch1 = rabbit_ct_client_helpers:open_channel(Config, 0),
@@ -89,8 +90,8 @@ register_interceptor1(Config) ->
 
     ok = rabbit_registry:register(channel_interceptor,
                                   <<"dummy interceptor">>,
-                                  dummy_interceptor),
-    [{interceptors, [{dummy_interceptor, undefined}]}] =
+                                  Interceptor),
+    [{interceptors, [{Interceptor, undefined}]}] =
       rabbit_channel:info(ChannelProc, [interceptors]),
 
     check_send_receive(Ch1, QName, <<"bar">>, <<"">>),
@@ -102,6 +103,9 @@ register_interceptor1(Config) ->
     check_send_receive(Ch1, QName, <<"bar">>, <<"bar">>),
     passed.
 
+register_failing_interceptors(Config) ->
+    passed = rabbit_ct_broker_helpers:rpc(Config, 0,
+      ?MODULE, register_interceptor1, [Config, failing_dummy_interceptor]).
 
 check_send_receive(Ch1, QName, Send, Receive) ->
     amqp_channel:call(Ch1,

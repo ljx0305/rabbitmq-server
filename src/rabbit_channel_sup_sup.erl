@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_channel_sup_sup).
@@ -27,16 +27,17 @@
 
 -export([init/1]).
 
+-include("rabbit.hrl").
+
 %%----------------------------------------------------------------------------
 
 -spec start_link() -> rabbit_types:ok_pid_or_error().
--spec start_channel(pid(), rabbit_channel_sup:start_link_args()) ->
-          {'ok', pid(), {pid(), any()}}.
-
-%%----------------------------------------------------------------------------
 
 start_link() ->
     supervisor2:start_link(?MODULE, []).
+
+-spec start_channel(pid(), rabbit_channel_sup:start_link_args()) ->
+          {'ok', pid(), {pid(), any()}}.
 
 start_channel(Pid, Args) ->
     supervisor2:start_child(Pid, [Args]).
@@ -44,6 +45,7 @@ start_channel(Pid, Args) ->
 %%----------------------------------------------------------------------------
 
 init([]) ->
+    ?LG_PROCESS_TYPE(channel_sup_sup),
     {ok, {{simple_one_for_one, 0, 1},
           [{channel_sup, {rabbit_channel_sup, start_link, []},
             temporary, infinity, supervisor, [rabbit_channel_sup]}]}}.

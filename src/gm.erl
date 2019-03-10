@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(gm).
@@ -395,12 +395,10 @@
 
 -define(GROUP_TABLE, gm_group).
 -define(MAX_BUFFER_SIZE, 100000000). %% 100MB
--define(HIBERNATE_AFTER_MIN, 1000).
--define(DESIRED_HIBERNATE, 10000).
 -define(BROADCAST_TIMER, 25).
+-define(FORCE_GC_TIMER, 250).
 -define(VERSION_START, 0).
 -define(SETS, ordsets).
--define(DICT, orddict).
 
 -record(state,
         { self,
@@ -416,6 +414,7 @@
           broadcast_buffer,
           broadcast_buffer_sz,
           broadcast_timer,
+          force_gc_timer,
           txn_executor,
           shutting_down
         }).
@@ -436,16 +435,6 @@
 
 -type group_name() :: any().
 -type txn_fun() :: fun((fun(() -> any())) -> any()).
-
--spec create_tables() -> 'ok' | {'aborted', any()}.
--spec start_link(group_name(), atom(), any(), txn_fun()) ->
-          rabbit_types:ok_pid_or_error().
--spec leave(pid()) -> 'ok'.
--spec broadcast(pid(), any()) -> 'ok'.
--spec confirmed_broadcast(pid(), any()) -> 'ok'.
--spec info(pid()) -> rabbit_types:infos().
--spec validate_members(pid(), [pid()]) -> 'ok'.
--spec forget_group(group_name()) -> 'ok'.
 
 %% The joined, members_changed and handle_msg callbacks can all return
 %% any of the following terms:
@@ -491,6 +480,8 @@
 -callback handle_terminate(Args :: term(), Reason :: term()) ->
     ok | term().
 
+-spec create_tables() -> 'ok' | {'aborted', any()}.
+
 create_tables() ->
     create_tables([?TABLE]).
 
@@ -507,25 +498,41 @@ table_definitions() ->
     {Name, Attributes} = ?TABLE,
     [{Name, [?TABLE_MATCH | Attributes]}].
 
+-spec start_link(group_name(), atom(), any(), txn_fun()) ->
+          rabbit_types:ok_pid_or_error().
+
 start_link(GroupName, Module, Args, TxnFun) ->
-    gen_server2:start_link(?MODULE, [GroupName, Module, Args, TxnFun], []).
+    gen_server2:start_link(?MODULE, [GroupName, Module, Args, TxnFun],
+                       [{spawn_opt, [{fullsweep_after, 0}]}]).
+
+-spec leave(pid()) -> 'ok'.
 
 leave(Server) ->
     gen_server2:cast(Server, leave).
+
+-spec broadcast(pid(), any()) -> 'ok'.
 
 broadcast(Server, Msg) -> broadcast(Server, Msg, 0).
 
 broadcast(Server, Msg, SizeHint) ->
     gen_server2:cast(Server, {broadcast, Msg, SizeHint}).
 
+-spec confirmed_broadcast(pid(), any()) -> 'ok'.
+
 confirmed_broadcast(Server, Msg) ->
     gen_server2:call(Server, {confirmed_broadcast, Msg}, infinity).
+
+-spec info(pid()) -> rabbit_types:infos().
 
 info(Server) ->
     gen_server2:call(Server, info, infinity).
 
+-spec validate_members(pid(), [pid()]) -> 'ok'.
+
 validate_members(Server, Members) ->
     gen_server2:cast(Server, {validate_members, Members}).
+
+-spec forget_group(group_name()) -> 'ok'.
 
 forget_group(GroupName) ->
     {atomic, ok} = mnesia:sync_transaction(
@@ -551,9 +558,9 @@ init([GroupName, Module, Args, TxnFun]) ->
                   broadcast_buffer    = [],
                   broadcast_buffer_sz = 0,
                   broadcast_timer     = undefined,
+                  force_gc_timer      = undefined,
                   txn_executor        = TxnFun,
-                  shutting_down       = false }, hibernate,
-     {backoff, ?HIBERNATE_AFTER_MIN, ?HIBERNATE_AFTER_MIN, ?DESIRED_HIBERNATE}}.
+                  shutting_down       = false }}.
 
 
 handle_call({confirmed_broadcast, _Msg}, _From,
@@ -708,6 +715,10 @@ handle_cast(leave, State) ->
     {stop, normal, State}.
 
 
+handle_info(force_gc, State) ->
+    garbage_collect(),
+    noreply(State #state { force_gc_timer = undefined });
+
 handle_info(flush, State) ->
     noreply(
       flush_broadcast_buffer(State #state { broadcast_timer = undefined }));
@@ -819,8 +830,8 @@ handle_msg({catchup, Left, MembersStateLeft},
                             members_state = MembersState })
   when MembersState =/= undefined ->
     MembersStateLeft1 = build_members_state(MembersStateLeft),
-    AllMembers = lists:usort(?DICT:fetch_keys(MembersState) ++
-                                 ?DICT:fetch_keys(MembersStateLeft1)),
+    AllMembers = lists:usort(maps:keys(MembersState) ++
+                                 maps:keys(MembersStateLeft1)),
     {MembersState1, Activity} =
         lists:foldl(
           fun (Id, MembersStateActivity) ->
@@ -883,13 +894,23 @@ handle_msg({activity, _NotLeft, _Activity}, State) ->
 
 
 noreply(State) ->
-    {noreply, ensure_broadcast_timer(State), flush_timeout(State)}.
+    {noreply, ensure_timers(State), flush_timeout(State)}.
 
 reply(Reply, State) ->
-    {reply, Reply, ensure_broadcast_timer(State), flush_timeout(State)}.
+    {reply, Reply, ensure_timers(State), flush_timeout(State)}.
 
-flush_timeout(#state{broadcast_buffer = []}) -> hibernate;
+ensure_timers(State) ->
+    ensure_force_gc_timer(ensure_broadcast_timer(State)).
+
+flush_timeout(#state{broadcast_buffer = []}) -> infinity;
 flush_timeout(_)                             -> 0.
+
+ensure_force_gc_timer(State = #state { force_gc_timer = TRef })
+  when is_reference(TRef) ->
+    State;
+ensure_force_gc_timer(State = #state { force_gc_timer = undefined }) ->
+    TRef = erlang:send_after(?FORCE_GC_TIMER, self(), force_gc),
+    State #state { force_gc_timer = TRef }.
 
 ensure_broadcast_timer(State = #state { broadcast_buffer = [],
                                         broadcast_timer  = undefined }) ->
@@ -958,8 +979,7 @@ flush_broadcast_buffer(State = #state { self             = Self,
                       end, Self, MembersState),
     State #state { members_state       = MembersState1,
                    broadcast_buffer    = [],
-                   broadcast_buffer_sz = 0}.
-
+                   broadcast_buffer_sz = 0 }.
 
 %% ---------------------------------------------------------------------------
 %% View construction and inspection
@@ -981,21 +1001,21 @@ is_member_alias(Member, Self, View) ->
 dead_member_id({dead, Member}) -> Member.
 
 store_view_member(VMember = #view_member { id = Id }, {Ver, View}) ->
-    {Ver, ?DICT:store(Id, VMember, View)}.
+    {Ver, maps:put(Id, VMember, View)}.
 
 with_view_member(Fun, View, Id) ->
     store_view_member(Fun(fetch_view_member(Id, View)), View).
 
-fetch_view_member(Id, {_Ver, View}) -> ?DICT:fetch(Id, View).
+fetch_view_member(Id, {_Ver, View}) -> maps:get(Id, View).
 
-find_view_member(Id, {_Ver, View}) -> ?DICT:find(Id, View).
+find_view_member(Id, {_Ver, View}) -> maps:find(Id, View).
 
-blank_view(Ver) -> {Ver, ?DICT:new()}.
+blank_view(Ver) -> {Ver, maps:new()}.
 
-alive_view_members({_Ver, View}) -> ?DICT:fetch_keys(View).
+alive_view_members({_Ver, View}) -> maps:keys(View).
 
 all_known_members({_Ver, View}) ->
-    ?DICT:fold(
+    maps:fold(
        fun (Member, #view_member { aliases = Aliases }, Acc) ->
                ?SETS:to_list(Aliases) ++ [Member | Acc]
        end, [], View).
@@ -1251,7 +1271,7 @@ neighbour_cast(N, Msg) -> ?INSTR_MOD:cast(get_pid(N), Msg).
 neighbour_call(N, Msg) -> ?INSTR_MOD:call(get_pid(N), Msg, infinity).
 
 %% ---------------------------------------------------------------------------
-%% View monitoring and maintanence
+%% View monitoring and maintenance
 %% ---------------------------------------------------------------------------
 
 ensure_neighbour(_Ver, Self, {Self, undefined}, Self) ->
@@ -1340,9 +1360,12 @@ find_common(A, B, Common) ->
             find_common(A1, B1, queue:in(Val, Common));
         {{empty, _A}, _} ->
             {Common, B};
-        {_, {_, B1}} ->
+        %% Drop value from B.
+        %% Match value to avoid infinite loop, since {empty, B} = queue:out(B).
+        {_, {{value, _}, B1}} ->
             find_common(A, B1, Common);
-        {{_, A1}, _} ->
+        %% Drop value from A. Empty A should be matched by second close.
+        {{{value, _}, A1}, _} ->
             find_common(A1, B, Common)
     end.
 
@@ -1360,24 +1383,24 @@ with_member_acc(Fun, Id, {MembersState, Acc}) ->
     {store_member(Id, MemberState, MembersState), Acc1}.
 
 find_member_or_blank(Id, MembersState) ->
-    case ?DICT:find(Id, MembersState) of
+    case maps:find(Id, MembersState) of
         {ok, Result} -> Result;
         error        -> blank_member()
     end.
 
-erase_member(Id, MembersState) -> ?DICT:erase(Id, MembersState).
+erase_member(Id, MembersState) -> maps:remove(Id, MembersState).
 
 blank_member() ->
     #member { pending_ack = queue:new(), last_pub = -1, last_ack = -1 }.
 
-blank_member_state() -> ?DICT:new().
+blank_member_state() -> maps:new().
 
 store_member(Id, MemberState, MembersState) ->
-    ?DICT:store(Id, MemberState, MembersState).
+    maps:put(Id, MemberState, MembersState).
 
-prepare_members_state(MembersState) -> ?DICT:to_list(MembersState).
+prepare_members_state(MembersState) -> maps:to_list(MembersState).
 
-build_members_state(MembersStateList) -> ?DICT:from_list(MembersStateList).
+build_members_state(MembersStateList) -> maps:from_list(MembersStateList).
 
 make_member(GroupName) ->
    {case dirty_read_group(GroupName) of
@@ -1546,9 +1569,10 @@ has_pending_messages(#state{ broadcast_buffer = Buffer })
   when Buffer =/= [] ->
     true;
 has_pending_messages(#state{ members_state = MembersState }) ->
-    [] =/= [M || {_, #member{last_pub = LP, last_ack = LA} = M}
-                 <- MembersState,
-                 LP =/= LA].
+    MembersWithPubAckMismatches = maps:filter(fun(_Id, #member{last_pub = LP, last_ack = LA}) ->
+                                                      LP =/= LA
+                                              end, MembersState),
+    0 =/= maps:size(MembersWithPubAckMismatches).
 
 maybe_confirm(_Self, _Id, Confirms, []) ->
     Confirms;

@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2017 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 -module(rabbit_core_metrics_gc).
 
@@ -19,11 +19,11 @@
                 interval
                }).
 
--spec start_link() -> rabbit_types:ok_pid_or_error().
-
 -export([start_link/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
          code_change/3]).
+
+-spec start_link() -> rabbit_types:ok_pid_or_error().
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -70,10 +70,33 @@ gc_channels() ->
     ok.
 
 gc_queues() ->
-    Queues = rabbit_amqqueue:list_names(),
+    gc_local_queues(),
+    gc_global_queues().
+
+gc_local_queues() ->
+    Queues = rabbit_amqqueue:list_local_names(),
     GbSet = gb_sets:from_list(Queues),
     gc_entity(queue_metrics, GbSet),
     gc_entity(queue_coarse_metrics, GbSet),
+    Followers = gb_sets:from_list(rabbit_amqqueue:list_local_followers()),
+    gc_leader_data(Followers).
+
+gc_leader_data(Followers) ->
+    ets:foldl(fun({Id, _, _, _, _}, none) ->
+                      gc_leader_data(Id, queue_coarse_metrics, Followers)
+              end, none, queue_coarse_metrics).
+
+gc_leader_data(Id, Table, GbSet) ->
+    case gb_sets:is_member(Id, GbSet) of
+        true ->
+            ets:delete(Table, Id),
+            none;
+        false ->
+            none
+    end.
+
+gc_global_queues() ->
+    GbSet = gb_sets:from_list(rabbit_amqqueue:list_names()),
     gc_process_and_entity(channel_queue_metrics, GbSet),
     gc_process_and_entity(consumer_created, GbSet),
     ExchangeGbSet = gb_sets:from_list(rabbit_exchange:list_names()),
@@ -131,13 +154,13 @@ gc_entity(Id, Table, Key, GbSet) ->
     end.
 
 gc_process_and_entity(Table, GbSet) ->
-    ets:foldl(fun({{Pid, Id} = Key, _, _, _, _, _, _, _}, none)
+    ets:foldl(fun({{Pid, Id} = Key, _, _, _, _, _, _, _, _}, none)
                   when Table == channel_queue_metrics ->
                       gc_process_and_entity(Id, Pid, Table, Key, GbSet);
                  ({{Pid, Id} = Key, _, _, _, _}, none)
                     when Table == channel_exchange_metrics ->
                       gc_process_and_entity(Id, Pid, Table, Key, GbSet);
-                 ({{Id, Pid, _} = Key, _, _, _, _}, none)
+                 ({{Id, Pid, _} = Key, _, _, _, _, _, _}, none)
                     when Table == consumer_created ->
                       gc_process_and_entity(Id, Pid, Table, Key, GbSet);
                  ({{{Pid, Id}, _} = Key, _, _, _, _}, none) ->

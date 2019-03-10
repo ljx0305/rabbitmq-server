@@ -11,12 +11,13 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2011-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2011-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(priority_queue_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 
 -compile(export_all).
@@ -32,6 +33,7 @@ groups() ->
      {cluster_size_2, [], [
                            ackfold,
                            drop,
+                           reject,
                            dropwhile_fetchwhile,
                            info_head_message_timestamp,
                            matching,
@@ -45,7 +47,9 @@ groups() ->
                            simple_order,
                            straight_through,
                            invoke,
-                           gen_server2_stats
+                           gen_server2_stats,
+                           negative_max_priorities,
+                           max_priorities_above_hard_limit
                           ]},
      {cluster_size_3, [], [
                            mirror_queue_auto_ack,
@@ -191,6 +195,28 @@ straight_through(Config) ->
     rabbit_ct_client_helpers:close_connection(Conn),
     passed.
 
+max_priorities_above_hard_limit(Config) ->
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Q = <<"max_priorities_above_hard_limit">>,
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       %% Note that lower values (e.g. 300) will overflow the byte type here.
+       %% However, values >= 256 would still be rejected when used by
+       %% other clients
+       declare(Ch, Q, 3000)),
+    rabbit_ct_client_helpers:close_connection(Conn),
+    passed.
+
+negative_max_priorities(Config) ->
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Q = <<"negative_max_priorities">>,
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       declare(Ch, Q, -10)),
+    rabbit_ct_client_helpers:close_connection(Conn),
+    passed.
+
+
 invoke(Config) ->
     %% Synthetic test to check the invoke callback, as the bug tested here
     %% is only triggered with a race condition.
@@ -306,6 +332,20 @@ drop(Config) ->
     rabbit_ct_client_helpers:close_connection(Conn),
     passed.
 
+reject(Config) ->
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Q = <<"reject-queue">>,
+    declare(Ch, Q, [{<<"x-max-length">>, long, 4},
+                    {<<"x-overflow">>, longstr, <<"reject-publish">>}
+                    | arguments(3)]),
+    publish(Ch, Q, [1, 2, 3, 1, 2, 3, 1, 2, 3]),
+    %% First 4 messages are published, all others are discarded.
+    get_all(Ch, Q, do_ack, [3, 2, 1, 1]),
+    delete(Ch, Q),
+    rabbit_ct_client_helpers:close_channel(Ch),
+    rabbit_ct_client_helpers:close_connection(Conn),
+    passed.
+
 purge(Config) ->
     {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
     Q = <<"purge-queue">>,
@@ -326,9 +366,9 @@ info_head_message_timestamp1(_Config) ->
     QName = rabbit_misc:r(<<"/">>, queue,
       <<"info_head_message_timestamp-queue">>),
     Q0 = rabbit_amqqueue:pseudo_queue(QName, self()),
-    Q = Q0#amqqueue{arguments = [{<<"x-max-priority">>, long, 2}]},
+    Q1 = amqqueue:set_arguments(Q0, [{<<"x-max-priority">>, long, 2}]),
     PQ = rabbit_priority_queue,
-    BQS1 = PQ:init(Q, new, fun(_, _) -> ok end),
+    BQS1 = PQ:init(Q1, new, fun(_, _) -> ok end),
     %% The queue is empty: no timestamp.
     true = PQ:is_empty(BQS1),
     '' = PQ:info(head_message_timestamp, BQS1),
@@ -375,9 +415,9 @@ info_head_message_timestamp1(_Config) ->
 ram_duration(_Config) ->
     QName = rabbit_misc:r(<<"/">>, queue, <<"ram_duration-queue">>),
     Q0 = rabbit_amqqueue:pseudo_queue(QName, self()),
-    Q = Q0#amqqueue{arguments = [{<<"x-max-priority">>, long, 5}]},
+    Q1 = amqqueue:set_arguments(Q0, [{<<"x-max-priority">>, long, 5}]),
     PQ = rabbit_priority_queue,
-    BQS1 = PQ:init(Q, new, fun(_, _) -> ok end),
+    BQS1 = PQ:init(Q1, new, fun(_, _) -> ok end),
     {_Duration1, BQS2} = PQ:ram_duration(BQS1),
     BQS3 = PQ:set_ram_duration_target(infinity, BQS2),
     BQS4 = PQ:set_ram_duration_target(1, BQS3),
@@ -654,7 +694,7 @@ get_ok(Ch, Q, Ack, PBin) ->
     {#'basic.get_ok'{delivery_tag = DTag}, #amqp_msg{payload = PBin2}} =
         amqp_channel:call(Ch, #'basic.get'{queue  = Q,
                                            no_ack = Ack =:= no_ack}),
-    PBin = PBin2,
+    ?assertEqual(PBin, PBin2),
     maybe_ack(Ch, Ack, DTag).
 
 get_payload(Ch, Q, Ack, Ps) ->

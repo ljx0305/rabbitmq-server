@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_peer_discovery_classic_config).
@@ -19,20 +19,25 @@
 
 -include("rabbit.hrl").
 
--export([list_nodes/0, register/0, unregister/0]).
+-export([list_nodes/0, supports_registration/0, register/0, unregister/0,
+         post_registration/0, lock/1, unlock/1]).
 
 %%
 %% API
 %%
 
--spec list_nodes() -> {ok, Nodes :: list()} | {error, Reason :: string()}.
+-spec list_nodes() -> {ok, {Nodes :: [node()], rabbit_types:node_type()}}.
 
 list_nodes() ->
-    case application:get_env(rabbit, cluster_nodes) of
-        {_Nodes, _NodeType} = Pair -> Pair;
-        Nodes when is_list(Nodes)  -> {Nodes, disc};
-        undefined                  -> {[], disc}
+    case application:get_env(rabbit, cluster_nodes, {[], disc}) of
+        {_Nodes, _NodeType} = Pair -> {ok, Pair};
+        Nodes when is_list(Nodes)  -> {ok, {Nodes, disc}}
     end.
+
+-spec supports_registration() -> boolean().
+
+supports_registration() ->
+    false.
 
 -spec register() -> ok.
 
@@ -42,4 +47,19 @@ register() ->
 -spec unregister() -> ok.
 
 unregister() ->
+    ok.
+
+-spec post_registration() -> ok.
+
+post_registration() ->
+    ok.
+
+-spec lock(Node :: atom()) -> not_supported.
+
+lock(_Node) ->
+    not_supported.
+
+-spec unlock(Data :: term()) -> ok.
+
+unlock(_Data) ->
     ok.

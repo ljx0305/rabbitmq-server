@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(dynamic_ha_SUITE).
@@ -57,12 +57,21 @@ groups() ->
       {clustered, [], [
           {cluster_size_2, [], [
               vhost_deletion,
-              promote_on_shutdown
+              force_delete_if_no_master,
+              promote_on_shutdown,
+              promote_on_failure,
+              slave_recovers_after_vhost_failure,
+              slave_recovers_after_vhost_down_and_up,
+              master_migrates_on_vhost_down,
+              slave_recovers_after_vhost_down_and_master_migrated,
+              queue_survive_adding_dead_vhost_mirror
             ]},
           {cluster_size_3, [], [
               change_policy,
               rapid_change,
-              nodes_policy_should_pick_master_from_its_params
+              nodes_policy_should_pick_master_from_its_params,
+              promote_slave_after_standalone_restart,
+              queue_survive_adding_dead_vhost_mirror
               % FIXME: Re-enable those tests when the know issues are
               % fixed.
               % failing_random_policies,
@@ -124,7 +133,7 @@ change_policy(Config) ->
 
     %% When we first declare a queue with no policy, it's not HA.
     amqp_channel:call(ACh, #'queue.declare'{queue = ?QNAME}),
-    timer:sleep(100),
+    timer:sleep(200),
     assert_slaves(A, ?QNAME, {A, ''}),
 
     %% Give it policy "all", it becomes HA and gets all mirrors
@@ -217,6 +226,19 @@ rapid_loop(Config, Node, MRef) ->
             rapid_loop(Config, Node, MRef)
     end.
 
+queue_survive_adding_dead_vhost_mirror(Config) ->
+    rabbit_ct_broker_helpers:force_vhost_failure(Config, 1, <<"/">>),
+    NodeA = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    ChA = rabbit_ct_client_helpers:open_channel(Config, NodeA),
+    QName = <<"queue_survive_adding_dead_vhost_mirror-q-1">>,
+    amqp_channel:call(ChA, #'queue.declare'{queue = QName}),
+    Q = find_queue(QName, NodeA),
+    Pid = proplists:get_value(pid, Q),
+    rabbit_ct_broker_helpers:set_ha_policy_all(Config),
+    %% Queue should not fail
+    Q1 = find_queue(QName, NodeA),
+    Pid = proplists:get_value(pid, Q1).
+
 %% Vhost deletion needs to successfully tear down policies and queues
 %% with policies. At least smoke-test that it doesn't blow up.
 vhost_deletion(Config) ->
@@ -227,12 +249,51 @@ vhost_deletion(Config) ->
     ok = rpc:call(A, rabbit_vhost, delete, [<<"/">>, <<"acting-user">>]),
     ok.
 
-promote_on_shutdown(Config) ->
+force_delete_if_no_master(Config) ->
     [A, B] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
-    rabbit_ct_broker_helpers:set_ha_policy(Config, A, <<"^ha.promote">>,
-      <<"all">>, [{<<"ha-promote-on-shutdown">>, <<"always">>}]),
     rabbit_ct_broker_helpers:set_ha_policy(Config, A, <<"^ha.nopromote">>,
       <<"all">>),
+    ACh = rabbit_ct_client_helpers:open_channel(Config, A),
+    [begin
+         amqp_channel:call(ACh, #'queue.declare'{queue   = Q,
+                                                 durable = true}),
+         rabbit_ct_client_helpers:publish(ACh, Q, 10)
+     end || Q <- [<<"ha.nopromote.test1">>, <<"ha.nopromote.test2">>]],
+    ok = rabbit_ct_broker_helpers:restart_node(Config, B),
+    ok = rabbit_ct_broker_helpers:stop_node(Config, A),
+
+    BCh = rabbit_ct_client_helpers:open_channel(Config, B),
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 404, _}}, _},
+       amqp_channel:call(
+         BCh, #'queue.declare'{queue   = <<"ha.nopromote.test1">>,
+                               durable = true})),
+
+    BCh1 = rabbit_ct_client_helpers:open_channel(Config, B),
+    ?assertExit(
+        {{shutdown, {server_initiated_close, 404, _}}, _},
+        amqp_channel:call(
+            BCh1, #'queue.declare'{queue   = <<"ha.nopromote.test2">>,
+                                   durable = true})),
+    BCh2 = rabbit_ct_client_helpers:open_channel(Config, B),
+    #'queue.delete_ok'{} =
+        amqp_channel:call(BCh2, #'queue.delete'{queue = <<"ha.nopromote.test1">>}),
+    %% Delete with if_empty will fail, since we don't know if the queue is empty
+    ?assertExit(
+        {{shutdown, {server_initiated_close, 406, _}}, _},
+        amqp_channel:call(BCh2, #'queue.delete'{queue = <<"ha.nopromote.test2">>,
+                                                if_empty = true})),
+    BCh3 = rabbit_ct_client_helpers:open_channel(Config, B),
+    #'queue.delete_ok'{} =
+        amqp_channel:call(BCh3, #'queue.delete'{queue = <<"ha.nopromote.test2">>}),
+    ok.
+
+promote_on_failure(Config) ->
+    [A, B] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    rabbit_ct_broker_helpers:set_ha_policy(Config, A, <<"^ha.promote">>,
+      <<"all">>, [{<<"ha-promote-on-failure">>, <<"always">>}]),
+    rabbit_ct_broker_helpers:set_ha_policy(Config, A, <<"^ha.nopromote">>,
+      <<"all">>, [{<<"ha-promote-on-failure">>, <<"when-synced">>}]),
 
     ACh = rabbit_ct_client_helpers:open_channel(Config, A),
     [begin
@@ -241,7 +302,7 @@ promote_on_shutdown(Config) ->
          rabbit_ct_client_helpers:publish(ACh, Q, 10)
      end || Q <- [<<"ha.promote.test">>, <<"ha.nopromote.test">>]],
     ok = rabbit_ct_broker_helpers:restart_node(Config, B),
-    ok = rabbit_ct_broker_helpers:stop_node(Config, A),
+    ok = rabbit_ct_broker_helpers:kill_node(Config, A),
     BCh = rabbit_ct_client_helpers:open_channel(Config, B),
     #'queue.declare_ok'{message_count = 0} =
         amqp_channel:call(
@@ -257,6 +318,54 @@ promote_on_shutdown(Config) ->
     #'queue.declare_ok'{message_count = 10} =
         amqp_channel:call(
           ACh2, #'queue.declare'{queue   = <<"ha.nopromote.test">>,
+                                 durable = true}),
+    ok.
+
+promote_on_shutdown(Config) ->
+    [A, B] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    rabbit_ct_broker_helpers:set_ha_policy(Config, A, <<"^ha.promote">>,
+      <<"all">>, [{<<"ha-promote-on-shutdown">>, <<"always">>}]),
+    rabbit_ct_broker_helpers:set_ha_policy(Config, A, <<"^ha.nopromote">>,
+      <<"all">>),
+    rabbit_ct_broker_helpers:set_ha_policy(Config, A, <<"^ha.nopromoteonfailure">>,
+      <<"all">>, [{<<"ha-promote-on-failure">>, <<"when-synced">>},
+                  {<<"ha-promote-on-shutdown">>, <<"always">>}]),
+
+    ACh = rabbit_ct_client_helpers:open_channel(Config, A),
+    [begin
+         amqp_channel:call(ACh, #'queue.declare'{queue   = Q,
+                                                 durable = true}),
+         rabbit_ct_client_helpers:publish(ACh, Q, 10)
+     end || Q <- [<<"ha.promote.test">>,
+                  <<"ha.nopromote.test">>,
+                  <<"ha.nopromoteonfailure.test">>]],
+    ok = rabbit_ct_broker_helpers:restart_node(Config, B),
+    ok = rabbit_ct_broker_helpers:stop_node(Config, A),
+    BCh = rabbit_ct_client_helpers:open_channel(Config, B),
+    BCh1 = rabbit_ct_client_helpers:open_channel(Config, B),
+    #'queue.declare_ok'{message_count = 0} =
+        amqp_channel:call(
+          BCh, #'queue.declare'{queue   = <<"ha.promote.test">>,
+                                durable = true}),
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 404, _}}, _},
+       amqp_channel:call(
+         BCh, #'queue.declare'{queue   = <<"ha.nopromote.test">>,
+                               durable = true})),
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 404, _}}, _},
+       amqp_channel:call(
+         BCh1, #'queue.declare'{queue   = <<"ha.nopromoteonfailure.test">>,
+                               durable = true})),
+    ok = rabbit_ct_broker_helpers:start_node(Config, A),
+    ACh2 = rabbit_ct_client_helpers:open_channel(Config, A),
+    #'queue.declare_ok'{message_count = 10} =
+        amqp_channel:call(
+          ACh2, #'queue.declare'{queue   = <<"ha.nopromote.test">>,
+                                 durable = true}),
+    #'queue.declare_ok'{message_count = 10} =
+        amqp_channel:call(
+          ACh2, #'queue.declare'{queue   = <<"ha.nopromoteonfailure.test">>,
                                  durable = true}),
     ok.
 
@@ -302,6 +411,78 @@ nodes_policy_should_pick_master_from_its_params(Config) ->
     amqp_channel:call(Ch, #'queue.delete'{queue = ?QNAME}),
     _ = rabbit_ct_broker_helpers:clear_policy(Config, A, ?POLICY).
 
+slave_recovers_after_vhost_failure(Config) ->
+    [A, B] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    rabbit_ct_broker_helpers:set_ha_policy_all(Config),
+    ACh = rabbit_ct_client_helpers:open_channel(Config, A),
+    QName = <<"slave_recovers_after_vhost_failure-q">>,
+    amqp_channel:call(ACh, #'queue.declare'{queue = QName}),
+    timer:sleep(500),
+    assert_slaves(A, QName, {A, [B]}, [{A, []}]),
+
+    %% Crash vhost on a node hosting a mirror
+    {ok, Sup} = rabbit_ct_broker_helpers:rpc(Config, B, rabbit_vhost_sup_sup, get_vhost_sup, [<<"/">>]),
+    exit(Sup, foo),
+
+    assert_slaves(A, QName, {A, [B]}, [{A, []}]).
+
+slave_recovers_after_vhost_down_and_up(Config) ->
+    [A, B] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    rabbit_ct_broker_helpers:set_ha_policy_all(Config),
+    ACh = rabbit_ct_client_helpers:open_channel(Config, A),
+    QName = <<"slave_recovers_after_vhost_down_and_up-q">>,
+    amqp_channel:call(ACh, #'queue.declare'{queue = QName}),
+    timer:sleep(200),
+    assert_slaves(A, QName, {A, [B]}, [{A, []}]),
+
+    %% Crash vhost on a node hosting a mirror
+    rabbit_ct_broker_helpers:force_vhost_failure(Config, B, <<"/">>),
+    %% rabbit_ct_broker_helpers:force_vhost_failure/2 will retry up to 10 times to
+    %% make sure that the top vhost supervision tree process did go down. MK.
+    timer:sleep(500),
+    %% Vhost is back up
+    case rabbit_ct_broker_helpers:rpc(Config, B, rabbit_vhost_sup_sup, start_vhost, [<<"/">>]) of
+      {ok, _Sup} -> ok;
+      {error,{already_started, _Sup}} -> ok
+    end,
+
+    assert_slaves(A, QName, {A, [B]}, [{A, []}]).
+
+master_migrates_on_vhost_down(Config) ->
+    [A, B] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    rabbit_ct_broker_helpers:set_ha_policy_all(Config),
+    ACh = rabbit_ct_client_helpers:open_channel(Config, A),
+    QName = <<"master_migrates_on_vhost_down-q">>,
+    amqp_channel:call(ACh, #'queue.declare'{queue = QName}),
+    timer:sleep(200),
+    assert_slaves(A, QName, {A, [B]}, [{A, []}]),
+
+    %% Crash vhost on the node hosting queue master
+    rabbit_ct_broker_helpers:force_vhost_failure(Config, A, <<"/">>),
+    timer:sleep(500),
+    assert_slaves(A, QName, {B, []}).
+
+slave_recovers_after_vhost_down_and_master_migrated(Config) ->
+    [A, B] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    rabbit_ct_broker_helpers:set_ha_policy_all(Config),
+    ACh = rabbit_ct_client_helpers:open_channel(Config, A),
+    QName = <<"slave_recovers_after_vhost_down_and_master_migrated-q">>,
+    amqp_channel:call(ACh, #'queue.declare'{queue = QName}),
+    timer:sleep(200),
+    assert_slaves(A, QName, {A, [B]}, [{A, []}]),
+    %% Crash vhost on the node hosting queue master
+    rabbit_ct_broker_helpers:force_vhost_failure(Config, A, <<"/">>),
+    timer:sleep(500),
+    assert_slaves(B, QName, {B, []}),
+
+    %% Restart the vhost on the node (previously) hosting queue master
+    case rabbit_ct_broker_helpers:rpc(Config, A, rabbit_vhost_sup_sup, start_vhost, [<<"/">>]) of
+      {ok, _Sup} -> ok;
+      {error,{already_started, _Sup}} -> ok
+    end,
+    timer:sleep(500),
+    assert_slaves(B, QName, {B, [A]}, [{B, []}]).
+
 random_policy(Config) ->
     run_proper(fun prop_random_policy/1, [Config]).
 
@@ -309,7 +490,7 @@ failing_random_policies(Config) ->
     [A, B | _] = Nodes = rabbit_ct_broker_helpers:get_node_configs(Config,
       nodename),
     %% Those set of policies were found as failing by PropEr in the
-    %% `random_policy` test above. We add them explicitely here to make
+    %% `random_policy` test above. We add them explicitly here to make
     %% sure they get tested.
     ?assertEqual(true, test_random_policy(Config, Nodes,
         [{nodes, [A, B]}, {nodes, [A]}])),
@@ -319,6 +500,45 @@ failing_random_policies(Config) ->
         [all, undefined, {exactly, 2}, all, {exactly, 3}, {exactly, 3},
           undefined, {exactly, 3}, all])).
 
+promote_slave_after_standalone_restart(Config) ->
+    %% Tests that slaves can be brought up standalone after forgetting the rest
+    %% of the cluster. Slave ordering should be irrelevant.
+    %% https://github.com/rabbitmq/rabbitmq-server/issues/1213
+    [A, B, C] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, A),
+
+    rabbit_ct_broker_helpers:set_ha_policy(Config, A, ?POLICY, <<"all">>),
+    amqp_channel:call(Ch, #'queue.declare'{queue = ?QNAME,
+                                           durable = true}),
+
+    rabbit_ct_client_helpers:publish(Ch, ?QNAME, 15),
+    rabbit_ct_client_helpers:close_channel(Ch),
+
+    timer:sleep(500),
+    15 = proplists:get_value(messages, find_queue(?QNAME, A)),
+
+    rabbit_ct_broker_helpers:stop_node(Config, C),
+    rabbit_ct_broker_helpers:stop_node(Config, B),
+    rabbit_ct_broker_helpers:stop_node(Config, A),
+
+    %% Restart one mirror
+    forget_cluster_node(Config, B, C),
+    forget_cluster_node(Config, B, A),
+
+    ok = rabbit_ct_broker_helpers:start_node(Config, B),
+    15 = proplists:get_value(messages, find_queue(?QNAME, B)),
+    ok = rabbit_ct_broker_helpers:stop_node(Config, B),
+
+    %% Restart the other
+    forget_cluster_node(Config, C, B),
+    forget_cluster_node(Config, C, A),
+
+    ok = rabbit_ct_broker_helpers:start_node(Config, C),
+    15 = proplists:get_value(messages, find_queue(?QNAME, C)),
+    ok = rabbit_ct_broker_helpers:stop_node(Config, C),
+
+    ok.
+
 %%----------------------------------------------------------------------------
 
 assert_slaves(RPCNode, QName, Exp) ->
@@ -327,9 +547,11 @@ assert_slaves(RPCNode, QName, Exp) ->
 assert_slaves(RPCNode, QName, Exp, PermittedIntermediate) ->
     assert_slaves0(RPCNode, QName, Exp,
                   [{get(previous_exp_m_node), get(previous_exp_s_nodes)} |
-                   PermittedIntermediate]).
+                   PermittedIntermediate], 1000).
 
-assert_slaves0(RPCNode, QName, {ExpMNode, ExpSNodes}, PermittedIntermediate) ->
+assert_slaves0(_, _, _, _, 0) ->
+    error(give_up_waiting_for_slaves);
+assert_slaves0(RPCNode, QName, {ExpMNode, ExpSNodes}, PermittedIntermediate, Attempts) ->
     Q = find_queue(QName, RPCNode),
     Pid = proplists:get_value(pid, Q),
     SPids = proplists:get_value(slave_pids, Q),
@@ -353,9 +575,10 @@ assert_slaves0(RPCNode, QName, {ExpMNode, ExpSNodes}, PermittedIntermediate) ->
                 State  ->
                     ct:pal("Waiting to leave state ~p~n Waiting for ~p~n",
                            [State, {ExpMNode, ExpSNodes}]),
-                    timer:sleep(100),
+                    timer:sleep(200),
                     assert_slaves0(RPCNode, QName, {ExpMNode, ExpSNodes},
-                                   PermittedIntermediate)
+                                   PermittedIntermediate,
+                                   Attempts - 1)
             end;
         true ->
             put(previous_exp_m_node, ExpMNode),
@@ -375,10 +598,14 @@ equal_list([H|T], Act)  -> case lists:member(H, Act) of
                            end.
 
 find_queue(QName, RPCNode) ->
+    find_queue(QName, RPCNode, 1000).
+
+find_queue(QName, RPCNode, 0) -> error({did_not_find_queue, QName, RPCNode});
+find_queue(QName, RPCNode, Attempts) ->
     Qs = rpc:call(RPCNode, rabbit_amqqueue, info_all, [?VHOST], infinity),
     case find_queue0(QName, Qs) of
         did_not_find_queue -> timer:sleep(100),
-                              find_queue(QName, RPCNode);
+                              find_queue(QName, RPCNode, Attempts - 1);
         Q -> Q
     end.
 
@@ -393,8 +620,8 @@ get_stacktrace() ->
     try
         throw(e)
     catch
-        _:e ->
-            erlang:get_stacktrace()
+        _:e:Stacktrace ->
+            Stacktrace
     end.
 
 %%----------------------------------------------------------------------------
@@ -528,3 +755,7 @@ apply_policy(Config, N, {exactly, Exactly}) ->
     rabbit_ct_broker_helpers:set_ha_policy(
       Config, N, ?POLICY, {<<"exactly">>, Exactly},
       [{<<"ha-sync-mode">>, <<"automatic">>}]).
+
+forget_cluster_node(Config, Node, NodeToRemove) ->
+    rabbit_ct_broker_helpers:rabbitmqctl(
+      Config, Node, ["forget_cluster_node", "--offline", NodeToRemove]).

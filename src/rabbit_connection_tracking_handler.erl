@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_connection_tracking_handler).
@@ -52,13 +52,25 @@ init([]) ->
 handle_event(#event{type = connection_created, props = Details}, State) ->
     ThisNode = node(),
     case pget(node, Details) of
-      ThisNode ->
-          rabbit_connection_tracking:register_connection(
-            rabbit_connection_tracking:tracked_connection_from_connection_created(Details)
-          );
-      _OtherNode ->
-        %% ignore
-        ok
+        ThisNode ->
+            TConn = rabbit_connection_tracking:tracked_connection_from_connection_created(Details),
+            ConnId = TConn#tracked_connection.id,
+            try
+                rabbit_connection_tracking:register_connection(TConn)
+            catch
+                error:{no_exists, _} ->
+                    Msg = "Could not register connection ~p for tracking, "
+                          "its table is not ready yet or the connection terminated prematurely",
+                    rabbit_log_connection:warning(Msg, [ConnId]),
+                    ok;
+                error:Err ->
+                    Msg = "Could not register connection ~p for tracking: ~p",
+                    rabbit_log_connection:warning(Msg, [ConnId, Err]),
+                    ok
+            end;
+        _OtherNode ->
+            %% ignore
+            ok
     end,
     {ok, State};
 handle_event(#event{type = connection_closed, props = Details}, State) ->
@@ -81,6 +93,18 @@ handle_event(#event{type = vhost_deleted, props = Details}, State) ->
     rabbit_log_connection:info("Closing all connections in vhost '~s' because it's being deleted", [VHost]),
     close_connections(rabbit_connection_tracking:list(VHost),
                       rabbit_misc:format("vhost '~s' is deleted", [VHost])),
+    {ok, State};
+%% Note: under normal circumstances this will be called immediately
+%% after the vhost_deleted above. Therefore we should be careful about
+%% what we log and be more defensive.
+handle_event(#event{type = vhost_down, props = Details}, State) ->
+    VHost = pget(name, Details),
+    Node = pget(node, Details),
+    rabbit_log_connection:info("Closing all connections in vhost '~s' on node '~s'"
+                               " because the vhost is stopping",
+                               [VHost, Node]),
+    close_connections(rabbit_connection_tracking:list_on_node(Node, VHost),
+                      rabbit_misc:format("vhost '~s' is down", [VHost])),
     {ok, State};
 handle_event(#event{type = user_deleted, props = Details}, State) ->
     Username = pget(name, Details),
@@ -122,7 +146,17 @@ close_connections(Tracked, Message, Delay) ->
     ok.
 
 close_connection(#tracked_connection{pid = Pid, type = network}, Message) ->
-    rabbit_networking:close_connection(Pid, Message);
+    try
+        rabbit_networking:close_connection(Pid, Message)
+    catch error:{not_a_connection, _} ->
+            %% could has been closed concurrently, or the input
+            %% is bogus. In any case, we should not terminate
+            ok;
+          _:Err ->
+            %% ignore, don't terminate
+            rabbit_log:warning("Could not close connection ~p: ~p", [Pid, Err]),
+            ok
+    end;
 close_connection(#tracked_connection{pid = Pid, type = direct}, Message) ->
     %% Do an RPC call to the node running the direct client.
     Node = node(Pid),

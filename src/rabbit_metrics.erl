@@ -11,7 +11,7 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is GoPivotal, Inc.
-%% Copyright (c) 2007-2016 Pivotal Software, Inc.  All rights reserved.
+%% Copyright (c) 2007-2019 Pivotal Software, Inc.  All rights reserved.
 %%
 
 -module(rabbit_metrics).
@@ -25,11 +25,12 @@
 
 -define(SERVER, ?MODULE).
 
--spec start_link() -> rabbit_types:ok_pid_or_error().
-
 %%----------------------------------------------------------------------------
 %% Starts the raw metrics storage and owns the ETS tables.
 %%----------------------------------------------------------------------------
+
+-spec start_link() -> rabbit_types:ok_pid_or_error().
+
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
 
